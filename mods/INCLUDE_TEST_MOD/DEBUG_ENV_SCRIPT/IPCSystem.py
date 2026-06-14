@@ -483,6 +483,29 @@ def JSON_PING(params, callback):
 
 
 
+_MCP_TOOLS_READY = False
+
+
+def _ENSURE_MCP_TOOLS():
+    # 幂等：注册自定义工具 JSON handler 并触发发现（导入内置 + 扫描用户目录）。
+    # McpTools 延迟 import 以规避与本模块的循环依赖。
+    global _MCP_TOOLS_READY
+    if _MCP_TOOLS_READY:
+        return
+    try:
+        from . import McpTools
+        _IPCSYSTEM.updateJsonHandlers({
+            "list_custom_tools": McpTools.JSON_LIST_CUSTOM_TOOLS,
+            "call_tool": McpTools.JSON_CALL_TOOL,
+            "rescan_custom_tools": McpTools.JSON_RESCAN_CUSTOM_TOOLS,
+        })
+        McpTools.DISCOVER_ALL()
+        _MCP_TOOLS_READY = True
+        print("[McpTools] 自定义工具已就绪，已注册 list_custom_tools/call_tool/rescan_custom_tools")
+    except Exception:
+        traceback.print_exc()
+
+
 _IPCSYSTEM = IPCSystem(GET_DEBUG_IPC_PORT())
 _IPCSYSTEM.updateHandlers(
     {
@@ -506,6 +529,7 @@ _IPCSYSTEM.updateJsonHandlers(
 def ON_CLIENT_INIT():
     global _CL_GAME_COMP
     _CL_GAME_COMP = clientApi.GetEngineCompFactory().CreateGame(clientApi.GetLevelId())
+    _ENSURE_MCP_TOOLS()
     _IPCSYSTEM.start()
 
 def ON_CLIENT_EXIT():
@@ -514,3 +538,4 @@ def ON_CLIENT_EXIT():
 def ON_SERVER_INIT():
     global _SR_GAME_COMP
     _SR_GAME_COMP = serverApi.GetEngineCompFactory().CreateGame(serverApi.GetLevelId())
+    _ENSURE_MCP_TOOLS()

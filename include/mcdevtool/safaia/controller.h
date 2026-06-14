@@ -80,6 +80,32 @@ namespace MCDevTool::Safaia {
         bool setControlVisible(const std::string& path, bool visible);
         bool setEnabled(bool enabled);
 
+        // ── 按需启用 UI 调试（默认关闭，游戏保持正常交互）──
+        // 引用计数 + 过渡互斥：首个会话启用并等待就绪，最后一个会话退出时关闭。
+        bool beginDebugSession(); // 返回是否已就绪
+        void endDebugSession();
+
+        // 显式“保持”调试开启（持有一个不配对的会话引用），供需要持久可见效果的场景
+        // （如 SetBoundsVisible/SetSelectedControls 后用 capture_game_window 截图）。
+        // on=true 持有；on=false 释放。幂等。
+        void setDebugHeld(bool on);
+        bool isDebugHeld() const { return heldSession_.load(); }
+
+        // RAII 守卫：进入确保 UI 调试启用（含就绪等待），离开计数归零时关闭。
+        // 让游戏默认处于正常（非调试）模式，仅在 UI 调试工具调用期间临时开启。
+        class DebugSession {
+        public:
+            explicit DebugSession(SafaiaController& c) : c_(&c), ready_(c.beginDebugSession()) {}
+            ~DebugSession() { c_->endDebugSession(); }
+            DebugSession(const DebugSession&)            = delete;
+            DebugSession& operator=(const DebugSession&) = delete;
+            bool ready() const { return ready_; }
+
+        private:
+            SafaiaController* c_;
+            bool              ready_;
+        };
+
     private:
         void log(const std::string& level, const std::string& msg);
 
@@ -100,8 +126,8 @@ namespace MCDevTool::Safaia {
         void      deliverResponse(const nlohmann::json& inner);
         void      drainResponses();
 
-        // enable 序列（独立线程：SetEnabled + 轮询 GetControlTree 直到就绪）。
-        void runEnableSequence();
+        // 按需启用：SetEnabled(true) + 轮询 GetControlTree 直到就绪（约 2s 内）。
+        bool performEnableAndWait();
 
         SafaiaControllerConfig cfg_;
         UiDebugState           state_;
@@ -127,6 +153,14 @@ namespace MCDevTool::Safaia {
         std::mutex                 respMtx_;
         std::condition_variable    respCv_;
         std::queue<nlohmann::json> respQueue_; // 仅存非带外响应（handle != 4,7）
+
+        // 按需启用状态（引用计数 + 过渡互斥）。默认关闭。
+        std::mutex              enableMtx_;
+        std::condition_variable enableCv_;
+        int                     enableRefCount_      = 0;
+        bool                    debugEnabled_        = false;
+        bool                    enableTransitioning_ = false;
+        std::atomic<bool>       heldSession_{false}; // 显式保持开启（持有一个引用）
     };
 
 } // namespace MCDevTool::Safaia

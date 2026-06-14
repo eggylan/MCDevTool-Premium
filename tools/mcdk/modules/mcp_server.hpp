@@ -4,6 +4,7 @@
 #include <memory>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include "./log_buffer.hpp"
 #include "./mcp_tool_definitions.hpp"
 #include <nlohmann/json.hpp>
@@ -19,6 +20,33 @@ namespace mcdk {
         bool        enabled    = false;
         std::string serverIp   = "localhost";
         int         serverPort = 19133;
+
+        // 各内置工具按工具名单独开关(缺省启用);未列出的工具默认启用。
+        std::map<std::string, bool> toolEnabled;
+        // 自定义工具组开关(整组:@mcp_tool 发现 + resync_custom_tools)。health_check 不受此约束,始终启用。
+        bool customTools = true;
+
+        bool isToolEnabled(const std::string& name) const {
+            auto it = toolEnabled.find(name);
+            return it == toolEnabled.end() ? true : it->second; // 缺省启用
+        }
+
+        // 是否有任一 UI 调试工具启用(决定是否启动 Safaia 控制器)。
+        bool anyUiDebugEnabled() const {
+            const char* uiNames[] = {
+                mcp_tool_definitions::UiControlTreeName,    mcp_tool_definitions::UiControlGetDataName,
+                mcp_tool_definitions::UiControlSearchName,  mcp_tool_definitions::UiLocateControlName,
+                mcp_tool_definitions::UiDebugOverlayName,   mcp_tool_definitions::UiSetVisibleName,
+                mcp_tool_definitions::UiGetSelectionName,   mcp_tool_definitions::UiWaitForSelectionName,
+                mcp_tool_definitions::UiSetDebugEnabledName,
+            };
+            for (const char* n : uiNames) {
+                if (isToolEnabled(n)) {
+                    return true;
+                }
+            }
+            return false;
+        }
     };
 
     // 从JSON获取MCP服务器配置
@@ -29,6 +57,21 @@ namespace mcdk {
             config.enabled    = mcpJson.value("enabled", false);
             config.serverIp   = mcpJson.value("server_ip", "localhost");
             config.serverPort = mcpJson.value("server_port", 19133);
+            // tools 段:每个内置工具名 -> bool(单独开关);特殊键 custom_tools 控制自定义工具组。
+            // 缺省全 true(无 tools 段 / 未列出的工具均启用),向后兼容。
+            auto toolsJson = mcpJson.value("tools", nlohmann::json::object());
+            if (toolsJson.is_object()) {
+                for (auto it = toolsJson.begin(); it != toolsJson.end(); ++it) {
+                    if (!it.value().is_boolean()) {
+                        continue;
+                    }
+                    if (it.key() == "custom_tools") {
+                        config.customTools = it.value().get<bool>();
+                    } else {
+                        config.toolEnabled[it.key()] = it.value().get<bool>();
+                    }
+                }
+            }
         }
         return config;
     }
@@ -69,6 +112,25 @@ namespace mcdk {
         void setMinecraftProcessId(int pid) { mcPid = pid; }
         void setSafaiaController(std::shared_ptr<MCDevTool::Safaia::SafaiaController> ctrl) {
             safaiaController = std::move(ctrl);
+        }
+
+        // ── 动态工具注册（供 CustomToolManager 使用；server 未启动时为空操作）──
+        bool isServerRunning() const { return server != nullptr; }
+
+        void registerDynamicTool(const mcp::tool& tool, mcp::tool_handler handler) {
+            if (server) {
+                server->register_tool(tool, std::move(handler));
+            }
+        }
+
+        bool unregisterDynamicTool(const std::string& name) {
+            return server ? server->unregister_tool(name) : false;
+        }
+
+        void notifyToolsListChanged() {
+            if (server) {
+                server->notify_tools_list_changed();
+            }
         }
 
         static nlohmann::json _logVectorToJson(const std::vector<std::string>& logVector) {
@@ -514,6 +576,8 @@ namespace mcdk {
                             return _textResult(false, cached->dump(2));
                         }
                     }
+                    // 临时启用 UI 调试取树，调用结束自动关闭（除非已显式保持开启）。
+                    MCDevTool::Safaia::SafaiaController::DebugSession dbg(*safaiaController);
                     auto r = safaiaController->getControlTree(rootPath);
                     if (r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlTree && r.success) {
                         return _textResult(false, r.data.dump(2));
@@ -548,6 +612,7 @@ namespace mcdk {
                     if (paths.empty()) {
                         return _textResult(true, "Parameter 'paths' must be a non-empty array of control paths.");
                     }
+                    MCDevTool::Safaia::SafaiaController::DebugSession dbg(*safaiaController);
                     auto r = safaiaController->getControlsData(paths);
                     if (r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlsData && r.success) {
                         return _textResult(false, r.data.dump(2));
@@ -585,6 +650,7 @@ namespace mcdk {
                     if (cached.has_value()) {
                         tree = *cached;
                     } else {
+                        MCDevTool::Safaia::SafaiaController::DebugSession dbg(*safaiaController);
                         auto r = safaiaController->getControlTree("/");
                         if (!(r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlTree && r.success)) {
                             std::string why = r.timeout ? "timed out" : ("unexpected response: " + r.handleName());
@@ -632,14 +698,17 @@ namespace mcdk {
                     if (paths.empty()) {
                         return _textResult(true, "Parameter 'paths' must be a non-empty array.");
                     }
+                    // 保持调试开启，使红框在 capture_game_window 时可见。
+                    safaiaController->setDebugHeld(true);
                     bool ok = safaiaController->setSelectedControls(paths);
                     if (!ok) {
                         return _textResult(true, "Failed to send SetSelectedControls (game disconnected?).");
                     }
                     return _textResult(
                         false,
-                        "Requested red-box highlight for " + std::to_string(paths.size())
-                            + " control(s) (fire-and-forget). Confirm with capture_game_window or ui_get_selection."
+                        "Highlighted " + std::to_string(paths.size())
+                            + " control(s) with a red box. UI debug mode is now ON so it stays visible — confirm with "
+                              "capture_game_window, then call ui_set_debug_enabled(enabled=false) to return to normal play."
                     );
                 }
             );
@@ -652,14 +721,23 @@ namespace mcdk {
                         return _textResult(true, "Game UI debugger not connected.");
                     }
                     bool visible = params.value("visible", false);
-                    bool ok      = safaiaController->setBoundsVisible(visible);
+                    if (visible) {
+                        safaiaController->setDebugHeld(true); // 先保持调试开启再显示轮廓
+                    }
+                    bool ok = safaiaController->setBoundsVisible(visible);
+                    if (!visible) {
+                        safaiaController->setDebugHeld(false); // 隐藏轮廓同时退出调试，恢复正常交互
+                    }
                     if (!ok) {
                         return _textResult(true, "Failed to send SetBoundsVisible (game disconnected?).");
                     }
                     return _textResult(
                         false,
-                        std::string("Bounds overlay ") + (visible ? "enabled" : "disabled")
-                            + " (fire-and-forget). Confirm with capture_game_window."
+                        std::string("Bounds overlay ")
+                            + (visible ? "enabled; UI debug mode is ON — confirm with capture_game_window, then call "
+                                         "ui_debug_overlay(visible=false) to return to normal play"
+                                       : "disabled; UI debug mode returned to normal play")
+                            + "."
                     );
                 }
             );
@@ -676,6 +754,7 @@ namespace mcdk {
                         return _textResult(true, "Parameter 'path' is required.");
                     }
                     bool visible = params.value("visible", true);
+                    MCDevTool::Safaia::SafaiaController::DebugSession dbg(*safaiaController);
                     bool ok      = safaiaController->setControlVisible(path, visible);
                     if (!ok) {
                         return _textResult(true, "Failed to send SetControlVisible (game disconnected?).");
@@ -729,6 +808,8 @@ namespace mcdk {
                     if (timeoutSec > 120) {
                         timeoutSec = 120;
                     }
+                    // 等待期间临时启用调试，使游戏内点击能产生 ControlSelectionChanged；结束后自动关闭。
+                    MCDevTool::Safaia::SafaiaController::DebugSession dbg(*safaiaController);
                     auto&                    st    = safaiaController->state();
                     uint64_t                 since = st.selectionSeq();
                     std::vector<std::string> out;
@@ -751,15 +832,45 @@ namespace mcdk {
                     return _textResult(false, result.dump(2));
                 }
             );
+
+            // ui_set_debug_enabled：显式保持/退出 UI 调试模式。默认关闭=游戏正常交互；
+            // 需要持久可见的调试效果（红框/轮廓）或连续多次调试操作时，先 enabled=true，完后 enabled=false。
+            server->register_tool(
+                mcp_tool_definitions::buildUiSetDebugEnabledTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    if (!safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    bool enabled = params.value("enabled", false);
+                    safaiaController->setDebugHeld(enabled);
+                    return _textResult(
+                        false,
+                        enabled ? "UI debug mode held ON. Clicks now select controls instead of operating the UI; "
+                                  "visualization tools (ui_locate_control / ui_debug_overlay) will persist. "
+                                  "Call ui_set_debug_enabled(enabled=false) to return to normal play."
+                                : "UI debug mode released; game returned to normal interaction."
+                    );
+                }
+            );
         }
 
-        // 初始化所有工具
+        // 初始化所有工具（每个工具按 .mcdev.json 的 mcp_server_config.tools 单独开关,缺省启用）
         void initTools() {
             initLogTool();
             initCodeExecutionTool();
             initGameTools();
             initGameWindowTools();
             initUiDebugTools();
+            // 应用单独开关:注销被显式禁用的内置工具(未列出的保持启用)。
+            // health_check 与自定义工具由 CustomToolManager 负责,不在此列。
+            for (const auto& [name, enabled] : config.toolEnabled) {
+                if (!enabled) {
+                    server->unregister_tool(name);
+                }
+            }
         }
 
         // 启动MCP服务器

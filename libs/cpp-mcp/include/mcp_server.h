@@ -295,6 +295,19 @@ namespace mcp {
         void register_tool(const tool& tool, tool_handler handler);
 
         /**
+         * @brief Unregister a tool by name (thread-safe; effective immediately for tools/list and tools/call)
+         * @param name The tool name to remove
+         * @return True if a tool with that name was removed
+         */
+        bool unregister_tool(const std::string& name);
+
+        /**
+         * @brief Notify all connected sessions that the tool list changed (notifications/tools/list_changed)
+         * @note Best-effort: only sessions with an active SSE/Streamable GET stream will receive it.
+         */
+        void notify_tools_list_changed();
+
+        /**
          * @brief Register a session cleanup handler
          * @param key Tool or resource name to be cleaned up
          * @param handler The function to call when the session is closed
