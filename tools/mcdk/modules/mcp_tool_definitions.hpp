@@ -71,8 +71,7 @@ For example, "entity.fragment" or "block.vertex". Do not include the file extens
         "Prefer get_latest_logs, get_latest_error_logs, and deterministic file/code checks first; use screenshots only "
         "when the task explicitly requires visual confirmation or logs cannot answer the question.";
 
-    inline constexpr const char* ClickGameWindowName = "click_game_window";
-    inline constexpr const char* ClickGameWindowDescription = R"(Simulates a left mouse click at a specific position on the Minecraft game window.
+    inline constexpr const char* ClickGameWindowName = "click_game_window";    inline constexpr const char* ClickGameWindowDescription = R"(Simulates a left mouse click at a specific position on the Minecraft game window.
 
 Coordinates are percentage-based (0.0 to 1.0) relative to the client area:
 - (0.0, 0.0) = top-left corner
@@ -85,6 +84,58 @@ The game window will be brought to the foreground automatically before clicking.
 Parameters:
 - x: Horizontal position as a percentage (0.0-1.0)
 - y: Vertical position as a percentage (0.0-1.0))";
+
+    // ── UI 调试工具（Safaia 控制器）────────────────────────────────
+    inline constexpr const char* UiControlTreeName = "ui_control_tree";
+    inline constexpr const char* UiControlTreeDescription = R"(Returns the in-game UI control tree (name/type/visible/children) for the current screen via the embedded Safaia UI debugger.
+
+Parameters:
+- root_path: Subtree root, e.g. "/" (default) or "/ScreenName/panel". Illegal roots time out.
+- force_refresh: If true, bypass the cache and re-fetch from the game (default false). The cache is invalidated automatically when the screen changes.)";
+
+    inline constexpr const char* UiControlGetDataName = "ui_control_get_data";
+    inline constexpr const char* UiControlGetDataDescription = R"(Returns the full property bag for the given control paths (position/size/alpha/layer/components/etc.) via the Safaia UI debugger.
+
+Parameters:
+- paths: Array of control paths (e.g. ["/ScreenName/panel/label"]). Keep each batch <= ~200 paths.)";
+
+    inline constexpr const char* UiControlSearchName = "ui_control_search";
+    inline constexpr const char* UiControlSearchDescription = R"(Searches the current UI control tree locally (no remote search RPC) and returns matching controls.
+
+Parameters:
+- keyword: Substring to match (case-insensitive).
+- by: Field to match against: "name" (default), "type", or "path".
+- limit: Max results to return (default 50).)";
+
+    inline constexpr const char* UiLocateControlName = "ui_locate_control";
+    inline constexpr const char* UiLocateControlDescription = R"(Highlights the given controls in-game with a red selection box (Safaia SetSelectedControls). Fire-and-forget; confirm visually with capture_game_window or via ui_get_selection.
+
+Parameters:
+- paths: Array of control paths to highlight.)";
+
+    inline constexpr const char* UiDebugOverlayName = "ui_debug_overlay";
+    inline constexpr const char* UiDebugOverlayDescription = R"(Toggles the full-screen control-bounds outline overlay in-game (Safaia SetBoundsVisible). Fire-and-forget.
+
+Parameters:
+- visible: true to show all control outlines, false to hide.)";
+
+    inline constexpr const char* UiSetVisibleName = "ui_set_visible";
+    inline constexpr const char* UiSetVisibleDescription = R"(Shows or hides a single UI control (Safaia SetControlVisible). Fire-and-forget; re-check with ui_control_get_data.
+
+Parameters:
+- path: Control path to toggle.
+- visible: true to show, false to hide.)";
+
+    inline constexpr const char* UiGetSelectionName = "ui_get_selection";
+    inline constexpr const char* UiGetSelectionDescription =
+        "Returns the most recently selected control path(s) captured from the game's in-debugger clicks "
+        "(Safaia ControlSelectionChanged). Returns immediately with the last known selection.";
+
+    inline constexpr const char* UiWaitForSelectionName = "ui_wait_for_selection";
+    inline constexpr const char* UiWaitForSelectionDescription = R"(Blocks until the next in-game control selection (a debugger click selects the deepest leaf), or until timeout. Use this to ask the user to click a control and capture its path.
+
+Parameters:
+- timeout: Seconds to wait (default 30, max 120).)";
 
     inline mcp::tool buildGetLatestLogsTool() {
         return mcp::tool_builder(GetLatestLogsName)
@@ -168,6 +219,73 @@ Parameters:
             .build();
     }
 
+    inline mcp::tool buildUiControlTreeTool() {
+        return mcp::tool_builder(UiControlTreeName)
+            .with_description(UiControlTreeDescription)
+            .with_string_param("root_path", "Subtree root path (default \"/\")", false)
+            .with_boolean_param("force_refresh", "Bypass cache and re-fetch (default false)", false)
+            .with_read_only_hint(true)
+            .build();
+    }
+
+    inline mcp::tool buildUiControlGetDataTool() {
+        return mcp::tool_builder(UiControlGetDataName)
+            .with_description(UiControlGetDataDescription)
+            .with_array_param("paths", "Control paths to fetch properties for", "string", true)
+            .with_read_only_hint(true)
+            .build();
+    }
+
+    inline mcp::tool buildUiControlSearchTool() {
+        return mcp::tool_builder(UiControlSearchName)
+            .with_description(UiControlSearchDescription)
+            .with_string_param("keyword", "Substring to match (case-insensitive)", true)
+            .with_string_param("by", "Match field: name | type | path (default name)", false)
+            .with_number_param("limit", "Max results (default 50)", false)
+            .with_read_only_hint(true)
+            .build();
+    }
+
+    inline mcp::tool buildUiLocateControlTool() {
+        return mcp::tool_builder(UiLocateControlName)
+            .with_description(UiLocateControlDescription)
+            .with_array_param("paths", "Control paths to highlight", "string", true)
+            .with_read_only_hint(false)
+            .build();
+    }
+
+    inline mcp::tool buildUiDebugOverlayTool() {
+        return mcp::tool_builder(UiDebugOverlayName)
+            .with_description(UiDebugOverlayDescription)
+            .with_boolean_param("visible", "Show (true) or hide (false) all control outlines", true)
+            .with_read_only_hint(false)
+            .build();
+    }
+
+    inline mcp::tool buildUiSetVisibleTool() {
+        return mcp::tool_builder(UiSetVisibleName)
+            .with_description(UiSetVisibleDescription)
+            .with_string_param("path", "Control path to toggle", true)
+            .with_boolean_param("visible", "Show (true) or hide (false)", true)
+            .with_read_only_hint(false)
+            .build();
+    }
+
+    inline mcp::tool buildUiGetSelectionTool() {
+        return mcp::tool_builder(UiGetSelectionName)
+            .with_description(UiGetSelectionDescription)
+            .with_read_only_hint(true)
+            .build();
+    }
+
+    inline mcp::tool buildUiWaitForSelectionTool() {
+        return mcp::tool_builder(UiWaitForSelectionName)
+            .with_description(UiWaitForSelectionDescription)
+            .with_number_param("timeout", "Seconds to wait (default 30, max 120)", false)
+            .with_read_only_hint(true)
+            .build();
+    }
+
     inline std::vector<mcp::tool> buildAllTools() {
         return {
             buildGetLatestLogsTool(),
@@ -180,6 +298,14 @@ Parameters:
             buildReloadSingleShaderTool(),
             buildCaptureGameWindowTool(),
             buildClickGameWindowTool(),
+            buildUiControlTreeTool(),
+            buildUiControlGetDataTool(),
+            buildUiControlSearchTool(),
+            buildUiLocateControlTool(),
+            buildUiDebugOverlayTool(),
+            buildUiSetVisibleTool(),
+            buildUiGetSelectionTool(),
+            buildUiWaitForSelectionTool(),
         };
     }
 

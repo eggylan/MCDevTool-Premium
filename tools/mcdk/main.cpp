@@ -294,6 +294,7 @@ static void launchGameExe(
     auto logBuffer       = std::make_shared<mcdk::LogBuffer>(1000, 250);
     auto errBuffer       = std::make_shared<mcdk::LogBuffer>(1000, 400);
     auto mcpServer       = mcdk::MCPServer(mcpServerConfig);
+    auto safaiaController = std::make_shared<MCDevTool::Safaia::SafaiaController>();
     if (mcpServerConfig.enabled) {
         // 若启用MCP服务器将自动启用IPC调试功能
         autoHotReload = true;
@@ -420,6 +421,27 @@ static void launchGameExe(
             }
             return ipcServer->sendMessage(7, fileName); // ONCE SHADER RELOAD
         });
+
+        // ── Safaia UI 调试控制器（接管游戏内 UI Debugger，暴露 ui_* MCP 工具）──
+        auto safaiaCfg    = mcdk::getSafaiaConfigFromJson(userConfig);
+        if (safaiaCfg.enabled) {
+            safaiaController->configure(safaiaCfg);
+            safaiaController->setLogger([](const std::string& level, const std::string& msg) {
+                ConsoleColor color = (level == "error")  ? ConsoleColor::Red
+                                     : (level == "warn") ? ConsoleColor::Yellow
+                                                         : ConsoleColor::Cyan;
+                printColoredAtomic("[Safaia] " + msg, color);
+            });
+            mcpServer.setSafaiaController(safaiaController);
+            if (safaiaController->start()) {
+                printColoredAtomic(
+                    "[MCDK] Safaia UI 调试控制器已启动（端口 " + std::to_string(safaiaController->boundPort()) + "）",
+                    ConsoleColor::Green
+                );
+            } else {
+                printColoredAtomic("[MCDK] Safaia UI 调试控制器启动失败（UI 调试工具将不可用）", ConsoleColor::Yellow);
+            }
+        }
     }
     mcdk::ReloadWatcherTask  reloadTask;
     mcdk::UserStyleProcessor styleProcessor(0, userConfig);
@@ -645,6 +667,8 @@ static void launchGameExe(
     ipcServer->safeExit();
     // 停止样式处理器
     styleProcessor.safeExit();
+    // 停止 Safaia UI 调试控制器（如已启用）
+    safaiaController->stop();
     // 安全的关闭MCP服务器(如果已启用)
     mcpServer.stop();
 
