@@ -1,5 +1,9 @@
-# MCDevTool
+# MCDevTool Premium
 适用于**网易我的世界**的开发者工具包，提供创建测试世界、加载用户Mod等功能，方便开发者在脱离**mcs编辑器**的环境下离线测试Mod。
+
+基于MCDevTool开发，原仓库地址：[MCDevTool](https://github.com/GitHub-Zero123/MCDevTool)
+
+本工具保持开源、免费，切勿轻信虚假信息。
 
 ![image](./mods/demo2.webp)
 
@@ -196,12 +200,41 @@ MCDEV配置文件，若不存在字段将以此处默认值为基准。
     // MCP服务器配置项
     "mcp_server_config": {
         // 是否启用MCP服务器功能
-        // 该MCP提供：日志查询，代码执行，画面捕获，自动化操作 等一系列功能。
-        "enabled": false,
+        // 该MCP提供：日志查询、代码执行、画面捕获、自动化操作、UI调试和自定义工具等功能。
+        "enabled": true,
         // 服务器IP地址
-        "server_ip": "localhost",
+        "server_ip": "127.0.0.1",
         // 服务器端口
-        "server_port": 19133
+        "server_port": 19133,
+        // 工具开关：可使用工具名逐个关闭，未列出的工具默认启用
+        "tools": {
+            // 日志查询
+            "get_latest_logs": true,
+            "get_log_range": true,
+            "get_latest_error_logs": true,
+            // Python代码执行
+            "execute_code": true,
+            // 游戏、Addon和着色器重载
+            "reload_game": true,
+            "reload_addon_and_game": true,
+            "reload_all_shaders": true,
+            "reload_single_shader": true,
+            // 游戏窗口截图和点击
+            "capture_game_window": true,
+            "click_game_window": true,
+            // UI调试
+            "ui_control_tree": true,
+            "ui_control_get_data": true,
+            "ui_control_search": true,
+            "ui_locate_control": true,
+            "ui_debug_overlay": true,
+            "ui_set_visible": true,
+            "ui_get_selection": true,
+            "ui_wait_for_selection": true,
+            "ui_set_debug_enabled": true,
+            // 自定义工具组开关
+            "custom_tools": true
+        }
     }
 }
 ```
@@ -244,6 +277,76 @@ VSCode 暂不支持直接连接 SSE，需通过 `mcp-remote` 桥接，配置在 
 ```
 
 > MCP 服务器随 `MCDK/MC` 一起启停，游戏关闭后需重新连接。各客户端对自动重连的支持情况不同，请自行测试。
+
+## UI 调试 MCP
+
+MCDK Premium 内置兼容 Safaia 协议的 UI 调试控制器，可直接读取游戏内控件树和属性，并提供搜索、定位、显隐和交互选取能力。相比只依赖截图和坐标点击，UI 调试工具能够返回稳定的控件路径及结构化属性，更适合排查 JSON UI 层级、布局和可见性问题。
+
+| 工具 | 作用 |
+|---|---|
+| `ui_control_tree` | 获取当前界面或指定子路径的控件树 |
+| `ui_control_get_data` | 批量读取控件位置、尺寸、透明度、层级和组件等属性 |
+| `ui_control_search` | 按名称、类型或路径搜索当前控件树 |
+| `ui_locate_control` | 在游戏内用红框高亮指定控件 |
+| `ui_debug_overlay` | 显示或隐藏全屏控件边界轮廓 |
+| `ui_set_visible` | 显示或隐藏指定控件 |
+| `ui_get_selection` | 获取最近一次在游戏内选中的控件路径 |
+| `ui_wait_for_selection` | 等待用户点击控件并返回最深层控件路径 |
+| `ui_set_debug_enabled` | 显式保持或关闭 UI 调试模式 |
+
+UI 调试模式默认关闭，普通点击仍按正常游戏交互执行。读取类工具会在调用期间临时启用调试模式；`ui_locate_control`、`ui_debug_overlay(visible=true)` 等需要保持可视效果的操作会持续启用调试模式。完成后请调用：
+
+```text
+ui_set_debug_enabled(enabled=false)
+```
+
+也可以对每个 `ui_*` 工具使用 `.mcdev.json` 中同名的 `mcp_server_config.tools` 开关。所有 UI 调试工具均关闭时，Safaia 控制器不会启动。
+
+推荐的排查流程：
+
+1. 使用 `ui_control_tree` 或 `ui_control_search` 找到目标控件路径；
+2. 使用 `ui_control_get_data` 检查控件属性；
+3. 使用 `ui_locate_control` 配合 `capture_game_window` 做视觉确认；
+4. 调试完成后关闭 UI 调试模式，恢复正常操作。
+
+## 自定义 MCP 工具
+
+MCDK Premium 支持使用 `@mcp_tool` 把普通 Python 2.7 函数注册为一等 MCP 工具。工具名称、说明和参数会转换为 MCP schema，客户端可以直接发现并调用，无需每次都通过 `execute_code` 拼接临时代码。
+
+工具文件支持两种作用域：
+
+| 作用域 | 目录 |
+|---|---|
+| 项目级 | `<included_mod_dir>/mcp_tools/*.py` |
+| 全局 | `%USERPROFILE%\.mcdk\mcp_tools\*.py` |
+
+最小示例：
+
+```python
+# -*- coding: utf-8 -*-
+
+@mcp_tool(
+    name="echo_message",
+    description="返回传入的消息",
+    params=[
+        {"name": "message", "type": "string", "description": "消息内容", "required": True},
+    ],
+    side="server",
+)
+def echo_message(message=""):
+    return {"echo": message}
+```
+
+`mcp_tool` 由扫描器自动注入，不需要也不能单独导入。新增、删除或修改工具文件后，调用 `resync_custom_tools` 即可重新扫描并动态注册/注销工具。stdio bridge 会转发 `tools/list_changed` 通知，支持该通知的客户端可自动刷新工具列表；其他客户端可通过重新连接 MCP 刷新。
+
+系统始终提供 `health_check` 检查游戏侧自定义工具链路。设置 `mcp_server_config.tools.custom_tools=false` 可关闭用户自定义工具和 `resync_custom_tools`，但不会关闭 `health_check`。
+
+> `mcp_tools/` 中的文件会在游戏侧直接执行，定位为受信任的开发者工具，不提供代码沙箱。请勿放入来源不明的脚本。
+
+完整参数、返回值、客户端/服务端线程规则和故障排查见：
+
+- [自定义 MCP 工具开发指南](docs/custom-mcp-tools-guide.md)
+- [自定义 MCP 工具示例](docs/examples/mcp_tools_example.py)
 
 ## MCP 游戏测试工作流策略
 
