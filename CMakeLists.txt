@@ -30,6 +30,10 @@ add_library(mcdevtool OBJECT
     src/reload.cpp
     src/debug.cpp
     src/style.cpp
+    src/safaia/protocol.cpp
+    src/safaia/ui_debug_state.cpp
+    src/safaia/discovery.cpp
+    src/safaia/controller.cpp
 )
 target_compile_features(mcdevtool PRIVATE cxx_std_23)
 target_compile_definitions(mcdevtool PRIVATE _CRT_SECURE_NO_WARNINGS)

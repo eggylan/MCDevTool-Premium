@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 #include <mcdevtool/env.h>
+#include <mcdevtool/safaia/controller.h>
 
 namespace mcdk {
     // 创建默认配置
@@ -87,9 +88,33 @@ namespace mcdk {
         return config;
     }
 
+    // 从 JSON 解析 Safaia UI 调试控制器配置（.mcdev.json 的 "safaia_ui_debug" 段）。
+    // 缺省 enabled=true（实际启动仍受 MCP server 是否启用约束，见 main.cpp）。
+    inline MCDevTool::Safaia::SafaiaControllerConfig getSafaiaConfigFromJson(const nlohmann::json& userConfig) {
+        MCDevTool::Safaia::SafaiaControllerConfig cfg;
+        auto j = userConfig.value("safaia_ui_debug", nlohmann::json::object());
+        if (j.is_object()) {
+            cfg.enabled               = j.value("enabled", true);
+            cfg.bindIp                = j.value("bind_ip", std::string("0.0.0.0"));
+            cfg.bindPort              = j.value("bind_port", 0);
+            cfg.advertiseIp           = j.value("advertise_ip", std::string("127.0.0.1"));
+            cfg.discoveryIntervalMs   = j.value("discovery_interval_ms", 500);
+            cfg.rpcTimeoutMs          = j.value("rpc_timeout_ms", 5000);
+            cfg.enableRetries         = j.value("enable_retries", 6);
+            cfg.enableRetryIntervalMs = j.value("enable_retry_interval_ms", 1500);
+            if (j.contains("target_ips") && j["target_ips"].is_array()) {
+                for (const auto& ip : j["target_ips"]) {
+                    if (ip.is_string()) {
+                        cfg.targetIps.push_back(ip.get<std::string>());
+                    }
+                }
+            }
+        }
+        return cfg;
+    }
+
     // 尝试更新游戏路径
-    inline bool updateGamePath(std::filesystem::path& path) {
-        auto autoExePath = MCDevTool::autoMatchLatestGameExePath();
+    inline bool updateGamePath(std::filesystem::path& path) {        auto autoExePath = MCDevTool::autoMatchLatestGameExePath();
         if (autoExePath.has_value()) {
             path = std::move(autoExePath.value());
             return true;

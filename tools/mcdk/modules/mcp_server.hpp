@@ -10,6 +10,7 @@
 #include <mcp_server.h>
 #include <base64.hpp>
 #include <mcdevtool/style.h>
+#include <mcdevtool/safaia/controller.h>
 
 namespace mcdk {
 
@@ -52,6 +53,7 @@ namespace mcdk {
         SimpleHandler                reloadAddonAndGameHandler; // 重载插件和游戏处理器
         StringParamHandler           reloadOnceShadersHandler;  // 重载单个着色器处理器
         int                          mcPid = 0;                 // 存储Minecraft进程ID以供后续使用
+        std::shared_ptr<MCDevTool::Safaia::SafaiaController> safaiaController; // UI 调试控制器（可空）
 
     public:
         MCPServer(const McpServerConfig& cfg) : config(cfg) {}
@@ -65,6 +67,9 @@ namespace mcdk {
         void setReloadOnceShadersHandler(StringParamHandler handler) { reloadOnceShadersHandler = std::move(handler); }
         void setReloadAddonAndGameHandler(SimpleHandler handler) { reloadAddonAndGameHandler = std::move(handler); }
         void setMinecraftProcessId(int pid) { mcPid = pid; }
+        void setSafaiaController(std::shared_ptr<MCDevTool::Safaia::SafaiaController> ctrl) {
+            safaiaController = std::move(ctrl);
+        }
 
         static nlohmann::json _logVectorToJson(const std::vector<std::string>& logVector) {
             nlohmann::json jsonArray = nlohmann::json::array();
@@ -72,6 +77,78 @@ namespace mcdk {
                 jsonArray.push_back({{"type", "text"}, {"text", log}});
             }
             return jsonArray;
+        }
+
+        // 构造单条文本结果（UI 调试工具统一使用）。
+        static nlohmann::json _textResult(bool isError, const std::string& text) {
+            return nlohmann::json{
+                {"isError", isError},
+                {"content", nlohmann::json::array({{{"type", "text"}, {"text", text}}})}
+            };
+        }
+
+        // 将 GetControlTree 响应树扁平化为 [{path,name,type,visible}]（对照 event_probe.flatten_tree）。
+        static void _flattenTreeWalk(
+            const nlohmann::json& node, const std::string& prefix, std::vector<nlohmann::json>& out, size_t limit
+        ) {
+            if (!node.is_object() || out.size() >= limit) {
+                return;
+            }
+            if (node.contains("data") && node["data"].is_object()) {
+                _flattenTreeWalk(node["data"], prefix, out, limit);
+            }
+            auto emit = [&](const std::string& path) {
+                out.push_back({
+                    {   "path",                  path},
+                    {   "name",   node.value("name", std::string{})},
+                    {   "type",   node.value("type", std::string{})},
+                    {"visible", node.value("visible", true)},
+                });
+            };
+            auto walkChildren = [&](const std::string& nextPrefix) {
+                if (node.contains("controls") && node["controls"].is_array()) {
+                    for (const auto& ch : node["controls"]) {
+                        _flattenTreeWalk(ch, nextPrefix, out, limit);
+                    }
+                } else if (node.contains("children") && node["children"].is_array()) {
+                    for (const auto& ch : node["children"]) {
+                        _flattenTreeWalk(ch, nextPrefix, out, limit);
+                    }
+                }
+            };
+
+            std::string explicitPath;
+            if (node.contains("path") && node["path"].is_string()) {
+                explicitPath = node["path"].get<std::string>();
+            }
+            if (!explicitPath.empty() && explicitPath != "/") {
+                emit(explicitPath);
+                walkChildren(explicitPath);
+                return;
+            }
+            std::string name = node.value("name", std::string{});
+            if (!name.empty()) {
+                std::string full = prefix.empty() ? ("/" + name) : (prefix + "/" + name);
+                emit(full);
+                walkChildren(full);
+            } else {
+                walkChildren(prefix);
+            }
+        }
+
+        static std::vector<nlohmann::json> _flattenTree(const nlohmann::json& treeData, size_t limit) {
+            std::vector<nlohmann::json> out;
+            if (treeData.is_object()) {
+                _flattenTreeWalk(treeData, "", out, limit);
+            }
+            return out;
+        }
+
+        static std::string _toLower(std::string s) {
+            for (auto& c : s) {
+                c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+            }
+            return s;
         }
 
         // 初始化日志相关的工具
@@ -414,12 +491,275 @@ namespace mcdk {
             );
         }
 
+        // 初始化 UI 调试工具（Safaia 控制器）。handler 在调用时检查控制器是否可用/已连接。
+        void initUiDebugTools() {
+            // ui_control_tree：读控件树（缓存或 GetControlTree，支持子路径与强制刷新）。
+            server->register_tool(
+                mcp_tool_definitions::buildUiControlTreeTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    if (!safaiaController->isConnected()) {
+                        return _textResult(
+                            true,
+                            "Game UI debugger not connected. Ensure the game is running and was launched by mcdk."
+                        );
+                    }
+                    std::string rootPath = params.value("root_path", std::string("/"));
+                    bool        force    = params.value("force_refresh", false);
+                    if (!force) {
+                        auto cached = safaiaController->state().getCachedTree(rootPath);
+                        if (cached.has_value()) {
+                            return _textResult(false, cached->dump(2));
+                        }
+                    }
+                    auto r = safaiaController->getControlTree(rootPath);
+                    if (r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlTree && r.success) {
+                        return _textResult(false, r.data.dump(2));
+                    }
+                    std::string why = r.timeout ? "timed out (illegal root path or UI debugger not ready)"
+                                                : ("unexpected response: " + r.handleName());
+                    if (!r.error.empty()) {
+                        why = r.error;
+                    }
+                    return _textResult(true, "ui_control_tree failed: " + why);
+                }
+            );
+
+            // ui_control_get_data：批量取控件属性。
+            server->register_tool(
+                mcp_tool_definitions::buildUiControlGetDataTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    if (!safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    std::vector<std::string> paths;
+                    if (params.contains("paths") && params["paths"].is_array()) {
+                        for (const auto& p : params["paths"]) {
+                            if (p.is_string()) {
+                                paths.push_back(p.get<std::string>());
+                            }
+                        }
+                    }
+                    if (paths.empty()) {
+                        return _textResult(true, "Parameter 'paths' must be a non-empty array of control paths.");
+                    }
+                    auto r = safaiaController->getControlsData(paths);
+                    if (r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlsData && r.success) {
+                        return _textResult(false, r.data.dump(2));
+                    }
+                    std::string why = r.timeout ? "timed out" : ("unexpected response: " + r.handleName());
+                    if (!r.error.empty()) {
+                        why = r.error;
+                    }
+                    return _textResult(true, "ui_control_get_data failed: " + why);
+                }
+            );
+
+            // ui_control_search：在缓存/拉取的树上本地过滤。
+            server->register_tool(
+                mcp_tool_definitions::buildUiControlSearchTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    if (!safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    std::string keyword = params.value("keyword", std::string{});
+                    std::string by      = params.value("by", std::string("name"));
+                    size_t      limit   = static_cast<size_t>(params.value("limit", 50));
+                    if (keyword.empty()) {
+                        return _textResult(true, "Parameter 'keyword' is required.");
+                    }
+                    if (by != "name" && by != "type" && by != "path") {
+                        by = "name";
+                    }
+                    // 取整树（缓存优先）。
+                    nlohmann::json tree;
+                    auto           cached = safaiaController->state().getCachedTree("/");
+                    if (cached.has_value()) {
+                        tree = *cached;
+                    } else {
+                        auto r = safaiaController->getControlTree("/");
+                        if (!(r.ok && r.handle == MCDevTool::Safaia::RPCHandles::GetControlTree && r.success)) {
+                            std::string why = r.timeout ? "timed out" : ("unexpected response: " + r.handleName());
+                            return _textResult(true, "ui_control_search failed to obtain tree: " + why);
+                        }
+                        tree = r.data;
+                    }
+                    auto           flat = _flattenTree(tree, 5000);
+                    std::string    kw   = _toLower(keyword);
+                    nlohmann::json hits = nlohmann::json::array();
+                    for (const auto& node : flat) {
+                        std::string field = node.value(by, std::string{});
+                        if (_toLower(field).find(kw) != std::string::npos) {
+                            hits.push_back(node);
+                            if (hits.size() >= limit) {
+                                break;
+                            }
+                        }
+                    }
+                    nlohmann::json result{
+                        {     "by",          by},
+                        {"keyword",     keyword},
+                        {  "count", hits.size()},
+                        {  "matches",      hits},
+                    };
+                    return _textResult(false, result.dump(2));
+                }
+            );
+
+            // ui_locate_control：红框高亮（fire-and-forget）。
+            server->register_tool(
+                mcp_tool_definitions::buildUiLocateControlTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController || !safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    std::vector<std::string> paths;
+                    if (params.contains("paths") && params["paths"].is_array()) {
+                        for (const auto& p : params["paths"]) {
+                            if (p.is_string()) {
+                                paths.push_back(p.get<std::string>());
+                            }
+                        }
+                    }
+                    if (paths.empty()) {
+                        return _textResult(true, "Parameter 'paths' must be a non-empty array.");
+                    }
+                    bool ok = safaiaController->setSelectedControls(paths);
+                    if (!ok) {
+                        return _textResult(true, "Failed to send SetSelectedControls (game disconnected?).");
+                    }
+                    return _textResult(
+                        false,
+                        "Requested red-box highlight for " + std::to_string(paths.size())
+                            + " control(s) (fire-and-forget). Confirm with capture_game_window or ui_get_selection."
+                    );
+                }
+            );
+
+            // ui_debug_overlay：全屏轮廓叠加（fire-and-forget）。
+            server->register_tool(
+                mcp_tool_definitions::buildUiDebugOverlayTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController || !safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    bool visible = params.value("visible", false);
+                    bool ok      = safaiaController->setBoundsVisible(visible);
+                    if (!ok) {
+                        return _textResult(true, "Failed to send SetBoundsVisible (game disconnected?).");
+                    }
+                    return _textResult(
+                        false,
+                        std::string("Bounds overlay ") + (visible ? "enabled" : "disabled")
+                            + " (fire-and-forget). Confirm with capture_game_window."
+                    );
+                }
+            );
+
+            // ui_set_visible：单控件显隐（fire-and-forget）。
+            server->register_tool(
+                mcp_tool_definitions::buildUiSetVisibleTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController || !safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    std::string path = params.value("path", std::string{});
+                    if (path.empty()) {
+                        return _textResult(true, "Parameter 'path' is required.");
+                    }
+                    bool visible = params.value("visible", true);
+                    bool ok      = safaiaController->setControlVisible(path, visible);
+                    if (!ok) {
+                        return _textResult(true, "Failed to send SetControlVisible (game disconnected?).");
+                    }
+                    return _textResult(
+                        false,
+                        "Set control '" + path + "' visible=" + (visible ? "true" : "false")
+                            + " (fire-and-forget). Re-check with ui_control_get_data."
+                    );
+                }
+            );
+
+            // ui_get_selection：读最后选中快照。
+            server->register_tool(
+                mcp_tool_definitions::buildUiGetSelectionTool(),
+                [this](const nlohmann::json&, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    auto           paths = safaiaController->state().lastSelection();
+                    nlohmann::json arr   = nlohmann::json::array();
+                    for (const auto& p : paths) {
+                        arr.push_back(p);
+                    }
+                    nlohmann::json result{
+                        {           "seq", safaiaController->state().selectionSeq()},
+                        {"current_screen",   safaiaController->state().currentScreen()},
+                        {     "selection",                                       arr},
+                    };
+                    if (paths.empty()) {
+                        result["note"] = "No selection captured yet. Use ui_wait_for_selection and click a control.";
+                    }
+                    return _textResult(false, result.dump(2));
+                }
+            );
+
+            // ui_wait_for_selection：阻塞等待下一个去重后的选中事件。
+            server->register_tool(
+                mcp_tool_definitions::buildUiWaitForSelectionTool(),
+                [this](const nlohmann::json& params, const std::string&) -> nlohmann::json {
+                    if (!safaiaController) {
+                        return _textResult(true, "Safaia UI debugger controller is not available.");
+                    }
+                    if (!safaiaController->isConnected()) {
+                        return _textResult(true, "Game UI debugger not connected.");
+                    }
+                    int timeoutSec = params.value("timeout", 30);
+                    if (timeoutSec <= 0) {
+                        timeoutSec = 30;
+                    }
+                    if (timeoutSec > 120) {
+                        timeoutSec = 120;
+                    }
+                    auto&                    st    = safaiaController->state();
+                    uint64_t                 since = st.selectionSeq();
+                    std::vector<std::string> out;
+                    uint64_t                 outSeq = 0;
+                    bool got = st.waitForSelection(since, timeoutSec * 1000, out, outSeq);
+                    if (!got) {
+                        return _textResult(
+                            true,
+                            "No control selected within " + std::to_string(timeoutSec) + "s (timeout)."
+                        );
+                    }
+                    nlohmann::json arr = nlohmann::json::array();
+                    for (const auto& p : out) {
+                        arr.push_back(p);
+                    }
+                    nlohmann::json result{
+                        {      "seq",                            outSeq},
+                        {"selection",                               arr},
+                    };
+                    return _textResult(false, result.dump(2));
+                }
+            );
+        }
+
         // 初始化所有工具
         void initTools() {
             initLogTool();
             initCodeExecutionTool();
             initGameTools();
             initGameWindowTools();
+            initUiDebugTools();
         }
 
         // 启动MCP服务器
