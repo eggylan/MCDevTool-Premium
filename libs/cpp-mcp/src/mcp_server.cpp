@@ -1217,10 +1217,21 @@ namespace mcp {
 
                     dispatcher->update_activity();
 
-                    bool result = dispatcher->wait_event(&sink);
+                    // 1 秒心跳上限同时约束 bridge 停止/切换会话时的最坏退出延迟。
+                    bool result = dispatcher->wait_event(&sink, std::chrono::seconds(1));
                     if (!result) {
-                        LOG_WARNING("Streamable HTTP: SSE stream closed for session ", session_id);
-                        return false;
+                        // 区分真正关闭与空闲超时:超时则发送 SSE 心跳注释保持长连接(供 bridge 持续接收
+                        // tools/list_changed 等服务端通知),不关闭流。
+                        if (dispatcher->is_closed() || !running_) {
+                            LOG_WARNING("Streamable HTTP: SSE stream closed for session ", session_id);
+                            return false;
+                        }
+                        const std::string heartbeat = ": keepalive\r\n\r\n";
+                        if (!sink.write(heartbeat.data(), heartbeat.size())) {
+                            return false;
+                        }
+                        dispatcher->update_activity();
+                        return true;
                     }
 
                     dispatcher->update_activity();

@@ -22,14 +22,18 @@
 #include <cctype>
 #include <chrono>
 #include <clocale>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -57,6 +61,7 @@ namespace {
     constexpr int         ConnectTimeoutSeconds    = 1;
     constexpr int         ReadWriteTimeoutSeconds  = 30;
     constexpr int         InitializationTimeoutSec = 3;
+    constexpr int         SseReadTimeoutSeconds    = 60; // 事件流读超时;显著长于 mcdk 1 秒心跳间隔
 
     struct BridgeConfig {
         std::string host = DefaultHost;
@@ -210,6 +215,43 @@ namespace {
     class GameMcpClient {
     public:
         explicit GameMcpClient(BridgeConfig config) : config_(std::move(config)) {}
+        ~GameMcpClient() { stopNotificationStream(); }
+
+        // 启动 SSE 通知转发:后台线程对 mcdk 开 GET 事件流,把服务端通知(如 tools/list_changed)
+        // 经 sink 转发到 stdio 客户端。会话建立/重连时自动(重)开流。
+        void startNotificationStream(std::function<void(const json&)> sink) {
+            {
+                std::lock_guard<std::mutex> lock(sseMtx_);
+                if (sseRunning_.load()) {
+                    return;
+                }
+                notificationSink_ = std::move(sink);
+                sseRunning_.store(true);
+            }
+            sseThread_ = std::thread([this]() { sseLoop(); });
+        }
+
+        void stopNotificationStream() {
+            if (!sseRunning_.exchange(false)) {
+                return;
+            }
+
+            std::shared_ptr<httplib::Client> activeClient;
+            {
+                std::lock_guard<std::mutex> lock(sseMtx_);
+                sseSessionId_.clear();
+                ++sseGen_;
+                activeClient = activeSseClient_;
+            }
+            sseCv_.notify_all();
+            if (activeClient) {
+                activeClient->stop();
+            }
+            if (sseThread_.joinable()) {
+                sseThread_.join();
+            }
+            notificationSink_ = nullptr;
+        }
 
         json callTool(const std::string& name, const json& arguments) {
             std::string error;
@@ -322,6 +364,9 @@ namespace {
             json ignored;
             std::string ignoredError;
             postJson(initializedNotification, ignored, ignoredError);
+
+            // 通知 SSE 监听线程切换到新会话(打开/重开 GET 事件流,接收 tools/list_changed 等)。
+            setSseSession(sessionId_);
             return true;
         }
 
@@ -378,10 +423,153 @@ namespace {
                 + baseUrl() + StreamableEndpoint + ". Detail: " + detail;
         }
 
+        // 设置/切换 SSE 监听目标会话(initialize 成功后调用);bump 代次以让旧流自行中止。
+        void setSseSession(const std::string& sid) {
+            std::shared_ptr<httplib::Client> activeClient;
+            {
+                std::lock_guard<std::mutex> lk(sseMtx_);
+                sseSessionId_ = sid;
+                ++sseGen_;
+                activeClient = activeSseClient_;
+            }
+            sseCv_.notify_all();
+            if (activeClient) {
+                activeClient->stop();
+            }
+        }
+
+        // 后台线程:对当前会话开 GET 事件流,持续把服务端通知转发到 stdio。
+        void sseLoop() {
+            while (sseRunning_.load()) {
+                std::string sid;
+                uint64_t    gen = 0;
+                {
+                    std::unique_lock<std::mutex> lk(sseMtx_);
+                    sseCv_.wait(lk, [&]() { return !sseRunning_.load() || !sseSessionId_.empty(); });
+                    if (!sseRunning_.load()) {
+                        break;
+                    }
+                    sid = sseSessionId_;
+                    gen = sseGen_;
+                }
+
+                auto client = std::make_shared<httplib::Client>(baseUrl());
+                client->set_connection_timeout(ConnectTimeoutSeconds, 0);
+                client->set_read_timeout(SseReadTimeoutSeconds, 0);
+
+                httplib::Headers headers = {
+                    {  "Mcp-Session-Id", sid},
+                    {"Accept", "text/event-stream"}
+                };
+
+                {
+                    std::lock_guard<std::mutex> lk(sseMtx_);
+                    if (!sseRunning_.load() || gen != sseGen_) {
+                        continue;
+                    }
+                    activeSseClient_ = client;
+                }
+
+                std::string buf;
+                client->Get(
+                    StreamableEndpoint,
+                    headers,
+                    [](const httplib::Response& response) { return response.status / 100 == 2; },
+                    [&](const char* data, size_t len) -> bool {
+                        if (!sseRunning_.load()) {
+                            return false;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(sseMtx_);
+                            if (gen != sseGen_) {
+                                return false; // 会话已切换,放弃旧流
+                            }
+                        }
+                        buf.append(data, len);
+                        drainSseFrames(buf);
+                        return true;
+                    }
+                );
+
+                {
+                    std::lock_guard<std::mutex> lk(sseMtx_);
+                    if (activeSseClient_ == client) {
+                        activeSseClient_.reset();
+                    }
+                }
+
+                // 流结束(空闲超时/断开/会话切换)。若仍在运行且会话未变,稍后重开。
+                if (sseRunning_.load()) {
+                    std::unique_lock<std::mutex> lk(sseMtx_);
+                    sseCv_.wait_for(lk, std::chrono::milliseconds(300), [&]() {
+                        return !sseRunning_.load() || gen != sseGen_;
+                    });
+                }
+            }
+        }
+
+        // 从 SSE 缓冲解析完整事件帧(以空行分隔),拼接 data: 行,JSON 解析后转发(仅含 method 的通知)。
+        void drainSseFrames(std::string& buf) {
+            for (;;) {
+                size_t end   = buf.find("\n\n");
+                size_t delim = 2;
+                size_t endr  = buf.find("\r\n\r\n");
+                if (endr != std::string::npos && (end == std::string::npos || endr < end)) {
+                    end   = endr;
+                    delim = 4;
+                }
+                if (end == std::string::npos) {
+                    return;
+                }
+                std::string frame = buf.substr(0, end);
+                buf.erase(0, end + delim);
+
+                std::string        data;
+                std::istringstream fs(frame);
+                std::string        line;
+                while (std::getline(fs, line)) {
+                    if (!line.empty() && line.back() == '\r') {
+                        line.pop_back();
+                    }
+                    if (line.rfind("data:", 0) == 0) {
+                        std::string v = line.substr(5);
+                        if (!v.empty() && v.front() == ' ') {
+                            v.erase(0, 1);
+                        }
+                        if (!data.empty()) {
+                            data += "\n";
+                        }
+                        data += v;
+                    }
+                }
+                if (data.empty()) {
+                    continue;
+                }
+                json msg = json::parse(data, nullptr, false);
+                if (msg.is_discarded() || !msg.is_object() || msg.value("jsonrpc", "") != "2.0"
+                    || !msg.contains("method") || (msg.contains("id") && !msg["id"].is_null())) {
+                    continue; // bridge 不代理服务端请求的响应链,仅转发 JSON-RPC 通知
+                }
+                if (notificationSink_) {
+                    notificationSink_(msg);
+                }
+            }
+        }
+
         BridgeConfig config_;
         std::string  sessionId_;
         bool         connected_ = false;
         int          nextId_    = 1;
+
+        // SSE 通知转发
+        std::function<void(const json&)> notificationSink_;
+        std::atomic<bool>                sseRunning_{false};
+        std::thread                      sseThread_;
+        std::mutex                       sseMtx_;
+        std::condition_variable          sseCv_;
+        std::string                      sseSessionId_;
+        uint64_t                         sseGen_ = 0;
+        std::shared_ptr<httplib::Client> activeSseClient_;
     };
 
     class BridgeServer {
@@ -390,6 +578,11 @@ namespace {
 
         void run() {
             StdioTransport transport;
+            // 启动 SSE 通知转发:把 mcdk 推送的 tools/list_changed 等通知透传到 stdio 客户端,
+            // 使运行时工具增删无需 /mcp 重连即可自动刷新。
+            gameClient_.startNotificationStream([&transport](const json& message) {
+                transport.writeMessage(message);
+            });
             while (true) {
                 auto message = transport.readMessage();
                 if (!message.has_value()) {
@@ -403,6 +596,7 @@ namespace {
                     transport.writeMessage(*response);
                 }
             }
+            gameClient_.stopNotificationStream(); // 在 transport 析构前停止 SSE 线程
         }
 
     private:
@@ -426,7 +620,7 @@ namespace {
                     id,
                     json{
                         {"protocolVersion", mcp::MCP_VERSION},
-                        {"capabilities", {{"tools", json::object()}}},
+                        {"capabilities", {{"tools", {{"listChanged", true}}}}},
                         {"serverInfo", {{"name", BridgeName}, {"version", BridgeVersion}}}
                     }
                 );

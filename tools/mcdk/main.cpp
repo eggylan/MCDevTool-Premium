@@ -470,7 +470,8 @@ static void launchGameExe(
                                   .with_description(
                                       "Re-scan and re-sync custom MCP tools from the game (picks up added/removed "
                                       "@mcp_tool functions and edited tool bodies). Returns the current custom tool set. "
-                                      "After this, run /mcp reconnect if your client does not auto-refresh tools/list."
+                                      "The stdio bridge forwards tools/list_changed automatically; reconnect only if "
+                                      "the MCP client does not honor that notification."
                                   )
                                   .with_read_only_hint(false)
                                   .build();

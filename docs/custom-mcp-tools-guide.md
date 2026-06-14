@@ -73,7 +73,7 @@ def get_player_position(player_id=None):
 | 操作 | 怎么生效 |
 |---|---|
 | **首次 / 启动前就放好** | 进游戏后连接时自动发现并注册 |
-| **运行时新增 / 删除工具文件** | 调用 MCP 工具 `resync_custom_tools` → 动态注册 / 注销,然后客户端 `/mcp` 重连刷新列表 |
+| **运行时新增 / 删除工具文件** | 调用 MCP 工具 `resync_custom_tools` → 动态注册 / 注销;stdio bridge 会转发 `tools/list_changed`,支持该通知的客户端自动刷新 |
 | **改已有工具的函数体** | 同样调 `resync_custom_tools` → 重新扫描即生效,**无需重连、无需重启游戏** |
 
 ---
@@ -215,7 +215,7 @@ def teleport_player(player_id=None, x=0, y=0, z=0,dimensionId=0):
 |---|---|
 | `resync_custom_tools` | 重扫所有工具目录(项目 + 全局),动态注册 / 注销变化的工具并广播 `tools/list_changed`。新增 / 删除 / 改函数体后调用它。 |
 
-> 调用 `resync_custom_tools` 后,若客户端没有自动刷新工具列表,执行 `/mcp` 重连即可看到增删。
+> stdio bridge 会通过 GET SSE 流转发 `tools/list_changed`。若客户端不支持或未响应该通知,再执行 `/mcp` 重连作为降级手段。
 
 ---
 
@@ -290,7 +290,7 @@ def teleport_player(player_id=None, x=0, y=0, z=0,dimensionId=0):
 
 | 现象 | 排查 |
 |---|---|
-| 工具没出现在 `tools/list` | 调 `resync_custom_tools` 后 `/mcp` 重连;确认文件在 `mcp_tools/` 下且不以 `__` 开头;确认 `@mcp_tool` 的 `name` 没和别的工具重名 |
+| 工具没出现在 `tools/list` | 调 `resync_custom_tools`;若客户端未自动刷新再 `/mcp` 重连;确认文件在 `mcp_tools/` 下且不以 `__` 开头;确认 `@mcp_tool` 的 `name` 没和别的工具重名 |
 | 调用报 "game not connected" | 游戏没进世界 / 已退出,IPC 未连接。进游戏后重试 |
 | 全局工具不生效 | 确认文件在 `%USERPROFILE%\.mcdk\mcp_tools\`;启动前就位才会在连接时自动发现,运行时新增需 `resync_custom_tools`;检查 `.mcdev.json` 未把 `global_mcp_tools_dir` 设为空串 |
 | 改了函数体没变化 | 调 `resync_custom_tools`(它会重新 exec 文件);内置工具(`McpToolsBuiltin.py`)属于嵌入脚本,改它需重新编译 mcdk + 重启游戏,而 `mcp_tools/` 下的用户工具则可热更新 |
