@@ -396,17 +396,19 @@ namespace mcp {
         std::lock_guard<std::mutex> lock(mutex_);
         tools_[tool.name] = std::make_pair(tool, handler);
 
-        // Auto-set tools capability so clients know we support tools
-        if (!capabilities_.contains("tools")) {
-            capabilities_["tools"] = json::object();
-        }
+        // Auto-set tools capability so clients know we support tools (and dynamic list changes)
+        capabilities_["tools"] = json::object({{"listChanged", true}});
 
         // Register methods for tool listing and calling
         if (method_handlers_.find("tools/list") == method_handlers_.end()) {
             method_handlers_["tools/list"] = [this](const json& params, const std::string& session_id) -> json {
+                // Hold mutex_ while iterating tools_ (dynamic register/unregister may run concurrently)
                 json tools_json = json::array();
-                for (const auto& [name, tool_pair] : tools_) {
-                    tools_json.push_back(tool_pair.first.to_json());
+                {
+                    std::lock_guard<std::mutex> tool_lock(mutex_);
+                    for (const auto& [name, tool_pair] : tools_) {
+                        tools_json.push_back(tool_pair.first.to_json());
+                    }
                 }
                 return json{{"tools", tools_json}};
             };
@@ -419,9 +421,17 @@ namespace mcp {
                 }
 
                 std::string tool_name = params["name"];
-                auto        it        = tools_.find(tool_name);
-                if (it == tools_.end()) {
-                    throw mcp_exception(error_code::invalid_params, "Tool not found: " + tool_name);
+
+                // Copy out the handler under lock, then invoke it WITHOUT holding the lock
+                // (handlers may perform slow IPC; holding mutex_ would block tools/list and register).
+                tool_handler handler_copy;
+                {
+                    std::lock_guard<std::mutex> tool_lock(mutex_);
+                    auto                        it = tools_.find(tool_name);
+                    if (it == tools_.end()) {
+                        throw mcp_exception(error_code::invalid_params, "Tool not found: " + tool_name);
+                    }
+                    handler_copy = it->second.second;
                 }
 
                 json tool_args = params.contains("arguments") ? params["arguments"] : json::array();
@@ -440,7 +450,7 @@ namespace mcp {
                 json tool_result = {{"isError", false}};
 
                 try {
-                    json raw_result = it->second.second(tool_args, session_id);
+                    json raw_result = handler_copy(tool_args, session_id);
 
                     // Support structured output (2025-03-26):
                     // If handler returns object with "content" key, extract it
@@ -464,6 +474,34 @@ namespace mcp {
 
                 return tool_result;
             };
+        }
+    }
+
+    bool server::unregister_tool(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return tools_.erase(name) > 0;
+    }
+
+    void server::notify_tools_list_changed() {
+        // Build the JSON-RPC notification framed as an SSE "message" event.
+        json              note = {{"jsonrpc", "2.0"}, {"method", "notifications/tools/list_changed"}};
+        std::stringstream ss;
+        ss << "event: message\r\ndata: " << note.dump() << "\r\n\r\n";
+        const std::string payload = ss.str();
+
+        // Copy dispatchers under lock, send outside the lock.
+        std::vector<std::shared_ptr<event_dispatcher>> dispatchers;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            dispatchers.reserve(session_dispatchers_.size());
+            for (const auto& [_, dispatcher] : session_dispatchers_) {
+                dispatchers.push_back(dispatcher);
+            }
+        }
+        for (const auto& d : dispatchers) {
+            if (d && !d->is_closed()) {
+                d->send_event(payload);
+            }
         }
     }
 

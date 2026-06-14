@@ -30,6 +30,7 @@
 #include "modules/utils.hpp"
 #include "modules/log_buffer.hpp"
 #include "modules/mcp_server.hpp"
+#include "modules/custom_tool_manager.hpp"
 
 
 // mcdevtool api
@@ -251,7 +252,9 @@ static std::wstring convertUtf8ToUtf16(const std::string& utf8Str) {
 }
 
 // 生成新的环境变量w字符串（继承当前环境变量并添加新变量）
-static std::wstring createNewEnvironmentBlock(const std::wstring& newVar, const std::wstring& newValue) {
+static std::wstring createNewEnvironmentBlock(
+    const std::vector<std::pair<std::wstring, std::wstring>>& newVars
+) {
     // 获取当前环境变量块
     LPWCH envBlock = GetEnvironmentStringsW();
     if (envBlock == nullptr) {
@@ -267,8 +270,10 @@ static std::wstring createNewEnvironmentBlock(const std::wstring& newVar, const 
         current     += varLine.size() + 1;
     }
 
-    // 添加新的环境变量
-    newEnvBlock += newVar + L'=' + newValue + L'\0';
+    // 追加新的环境变量
+    for (const auto& [name, value] : newVars) {
+        newEnvBlock += name + L'=' + value + L'\0';
+    }
 
     // 结束环境变量块
     newEnvBlock += L'\0';
@@ -295,6 +300,7 @@ static void launchGameExe(
     auto errBuffer       = std::make_shared<mcdk::LogBuffer>(1000, 400);
     auto mcpServer       = mcdk::MCPServer(mcpServerConfig);
     auto safaiaController = std::make_shared<MCDevTool::Safaia::SafaiaController>();
+    mcdk::CustomToolManager customToolManager;
     if (mcpServerConfig.enabled) {
         // 若启用MCP服务器将自动启用IPC调试功能
         autoHotReload = true;
@@ -423,8 +429,9 @@ static void launchGameExe(
         });
 
         // ── Safaia UI 调试控制器（接管游戏内 UI Debugger，暴露 ui_* MCP 工具）──
+        // 仅当存在任一启用的 ui_* 工具时启动（受各 ui 工具单独开关 + safaia_ui_debug.enabled 约束）。
         auto safaiaCfg    = mcdk::getSafaiaConfigFromJson(userConfig);
-        if (safaiaCfg.enabled) {
+        if (mcpServerConfig.anyUiDebugEnabled() && safaiaCfg.enabled) {
             safaiaController->configure(safaiaCfg);
             safaiaController->setLogger([](const std::string& level, const std::string& msg) {
                 ConsoleColor color = (level == "error")  ? ConsoleColor::Red
@@ -441,6 +448,49 @@ static void launchGameExe(
             } else {
                 printColoredAtomic("[MCDK] Safaia UI 调试控制器启动失败（UI 调试工具将不可用）", ConsoleColor::Yellow);
             }
+        }
+
+        // ── 自定义 MCP 工具管理器 ──
+        // 始终启动：注册内置 health_check(始终启用,不可关);用户 @mcp_tool 工具及 resync_custom_tools
+        // 受 mcp_server_config.tools.custom_tools 开关约束。
+        customToolManager.configure(&mcpServer, ipcServer);
+        customToolManager.setIncludeUserTools(mcpServerConfig.customTools);
+        customToolManager.setLogger([](const std::string& level, const std::string& msg) {
+            ConsoleColor color = (level == "error")  ? ConsoleColor::Red
+                                 : (level == "warn") ? ConsoleColor::Yellow
+                                                     : ConsoleColor::Cyan;
+            printColoredAtomic("[CustomTools] " + msg, color);
+        });
+        customToolManager.start();
+
+        if (mcpServerConfig.customTools) {
+            // 用户可手动触发的自定义工具重扫/重同步：重新拉取游戏侧注册表(含重扫 mcp_tools/ 目录)，
+            // 动态增删一等 MCP 工具并广播 tools/list_changed。
+            auto resyncTool = mcp::tool_builder("resync_custom_tools")
+                                  .with_description(
+                                      "Re-scan and re-sync custom MCP tools from the game (picks up added/removed "
+                                      "@mcp_tool functions and edited tool bodies). Returns the current custom tool set. "
+                                      "After this, run /mcp reconnect if your client does not auto-refresh tools/list."
+                                  )
+                                  .with_read_only_hint(false)
+                                  .build();
+            mcpServer.registerDynamicTool(
+                resyncTool,
+                [&customToolManager](const nlohmann::json&, const std::string&) -> nlohmann::json {
+                    customToolManager.syncNow();
+                    auto           names = customToolManager.registeredNames();
+                    nlohmann::json arr   = nlohmann::json::array();
+                    for (const auto& n : names) {
+                        arr.push_back(n);
+                    }
+                    std::string text = "Custom tools resynced. Registered (" + std::to_string(names.size())
+                                     + "): " + arr.dump();
+                    return nlohmann::json{
+                        {"isError", false},
+                        {"content", nlohmann::json::array({{{"type", "text"}, {"text", text}}})}
+                    };
+                }
+            );
         }
     }
     mcdk::ReloadWatcherTask  reloadTask;
@@ -459,7 +509,31 @@ static void launchGameExe(
         // std::cout << "[MCDK] IPC调试服务器已启动，端口：" << port <<
         // _MCDEV_LOG_OUTPUT_ENDL;
         printColoredAtomic("[MCDK] IPC调试服务器已启动，端口：" + std::to_string(port), ConsoleColor::Green);
-        newEnv        = createNewEnvironmentBlock(L"MCDEV_DEBUG_IPC_PORT", std::to_wstring(port));
+
+        std::vector<std::pair<std::wstring, std::wstring>> envVars;
+        envVars.emplace_back(L"MCDEV_DEBUG_IPC_PORT", std::to_wstring(port));
+
+        // 全局自定义工具目录：默认 %USERPROFILE%\.mcdk\mcp_tools，可由 .mcdev.json 的
+        // global_mcp_tools_dir 覆盖（显式空串则禁用）。所有项目共享，开发者放一次处处可用。
+        std::filesystem::path globalToolsDir;
+        if (userConfig.contains("global_mcp_tools_dir") && userConfig["global_mcp_tools_dir"].is_string()) {
+            std::string v = userConfig["global_mcp_tools_dir"].get<std::string>();
+            if (!v.empty()) {
+                globalToolsDir = std::filesystem::path(v);
+            }
+        } else if (const wchar_t* up = _wgetenv(L"USERPROFILE"); up && *up) {
+            globalToolsDir = std::filesystem::path(up) / L".mcdk" / L"mcp_tools";
+        }
+        if (!globalToolsDir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(globalToolsDir, ec); // best-effort，便于开发者找到投放位置
+            envVars.emplace_back(L"MCDEV_GLOBAL_MCP_TOOLS", globalToolsDir.wstring());
+            auto        u8 = globalToolsDir.u8string();
+            std::string shown(u8.begin(), u8.end());
+            printColoredAtomic("[MCDK] 全局自定义工具目录：" + shown, ConsoleColor::Green);
+        }
+
+        newEnv        = createNewEnvironmentBlock(envVars);
         lpEnvironment = (void*)newEnv.data();
     }
 
@@ -669,6 +743,8 @@ static void launchGameExe(
     styleProcessor.safeExit();
     // 停止 Safaia UI 调试控制器（如已启用）
     safaiaController->stop();
+    // 停止自定义工具管理器（如已启用）
+    customToolManager.stop();
     // 安全的关闭MCP服务器(如果已启用)
     mcpServer.stop();
 

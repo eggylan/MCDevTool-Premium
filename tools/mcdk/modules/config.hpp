@@ -54,6 +54,38 @@ namespace mcdk {
             {       "enable_cheats",                          true},
             // 保留物品栏
             {      "keep_inventory",                          true},
+            // MCP 服务器：自动创建的默认配置即启用。
+            // tools 段为各内置工具的单独开关(缺省全 true);custom_tools 为自定义工具组开关。
+            // health_check 始终启用,不在此列。
+            {  "mcp_server_config",
+             nlohmann::json{
+                 {    "enabled",                  true},
+                 {  "server_ip",           "127.0.0.1"},
+                 {"server_port",                 19133},
+                 {      "tools",
+                  nlohmann::json{
+                      {        "get_latest_logs", true},
+                      {          "get_log_range", true},
+                      {  "get_latest_error_logs", true},
+                      {           "execute_code", true},
+                      {            "reload_game", true},
+                      {  "reload_addon_and_game", true},
+                      {      "reload_all_shaders", true},
+                      {    "reload_single_shader", true},
+                      {     "capture_game_window", true},
+                      {       "click_game_window", true},
+                      {         "ui_control_tree", true},
+                      {     "ui_control_get_data", true},
+                      {       "ui_control_search", true},
+                      {       "ui_locate_control", true},
+                      {        "ui_debug_overlay", true},
+                      {          "ui_set_visible", true},
+                      {        "ui_get_selection", true},
+                      {   "ui_wait_for_selection", true},
+                      {    "ui_set_debug_enabled", true},
+                      {            "custom_tools", true},
+                  }},
+             }},
         };
         // 游戏可执行文件路径
         auto u8Path = exePath.generic_u8string();

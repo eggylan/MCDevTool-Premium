@@ -137,6 +137,12 @@ Parameters:
 Parameters:
 - timeout: Seconds to wait (default 30, max 120).)";
 
+    inline constexpr const char* UiSetDebugEnabledName = "ui_set_debug_enabled";
+    inline constexpr const char* UiSetDebugEnabledDescription = R"(Holds UI debug mode ON or OFF. By default the game is NOT in debug mode (clicks operate the UI normally); individual UI query tools enable it only for the duration of the call. While held ON, in-game clicks SELECT controls instead of operating them, and visualization effects (ui_locate_control red box, ui_debug_overlay outlines) persist so you can capture_game_window. Always set back to false when done so the game returns to normal interaction.
+
+Parameters:
+- enabled: true to hold debug mode on, false to release it.)";
+
     inline mcp::tool buildGetLatestLogsTool() {
         return mcp::tool_builder(GetLatestLogsName)
             .with_description(GetLatestLogsDescription)
@@ -286,6 +292,14 @@ Parameters:
             .build();
     }
 
+    inline mcp::tool buildUiSetDebugEnabledTool() {
+        return mcp::tool_builder(UiSetDebugEnabledName)
+            .with_description(UiSetDebugEnabledDescription)
+            .with_boolean_param("enabled", "true to hold UI debug mode on, false to release", true)
+            .with_read_only_hint(false)
+            .build();
+    }
+
     inline std::vector<mcp::tool> buildAllTools() {
         return {
             buildGetLatestLogsTool(),
@@ -306,6 +320,7 @@ Parameters:
             buildUiSetVisibleTool(),
             buildUiGetSelectionTool(),
             buildUiWaitForSelectionTool(),
+            buildUiSetDebugEnabledTool(),
         };
     }
 

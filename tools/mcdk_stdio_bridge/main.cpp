@@ -241,6 +241,34 @@ namespace {
             return response["result"];
         }
 
+        // 实时转发 tools/list 到 mcdk,返回 {"tools":[...]}（反映逐工具开关与动态自定义工具）。
+        // 连接失败返回 null（由调用方决定是否回退到静态内置集）。
+        json listTools(std::string& error) {
+            if (!ensureConnected(error)) {
+                return json();
+            }
+            json request = {{"jsonrpc", "2.0"}, {"id", nextId_++}, {"method", "tools/list"}, {"params", json::object()}};
+            json response;
+            if (!postJson(request, response, error)) {
+                connected_ = false;
+                sessionId_.clear();
+                if (!ensureConnected(error)) {
+                    return json();
+                }
+                request["id"] = nextId_++;
+                if (!postJson(request, response, error)) {
+                    connected_ = false;
+                    sessionId_.clear();
+                    return json();
+                }
+            }
+            if (response.contains("error") || !response.contains("result")) {
+                error = "MCDK game MCP returned an invalid tools/list response";
+                return json();
+            }
+            return response["result"];
+        }
+
     private:
         bool ensureConnected(std::string& error) {
             if (connected_ && ping()) {
@@ -407,6 +435,13 @@ namespace {
                 return makeSuccessResponse(id, json::object());
             }
             if (method == "tools/list") {
+                // 实时转发 mcdk 的工具列表,反映 .mcdev.json 逐工具开关与动态自定义工具。
+                std::string error;
+                json        result = gameClient_.listTools(error);
+                if (result.is_object() && result.contains("tools")) {
+                    return makeSuccessResponse(id, result);
+                }
+                // 回退:mcdk 不可达时返回静态内置工具集(降级,可能含被禁用项 / 不含自定义工具)。
                 json tools = json::array();
                 for (const auto& tool : mcdk::mcp_tool_definitions::buildAllTools()) {
                     tools.push_back(tool.to_json());

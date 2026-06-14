@@ -157,6 +157,15 @@ namespace MCDevTool::Safaia {
         clientConnected_.store(false);
         state_.resetForDisconnect();
         {
+            // 复位按需启用状态，唤醒可能等待过渡的 begin/end；下次连接从“关闭”重新开始。
+            std::lock_guard<std::mutex> lk(enableMtx_);
+            enableRefCount_      = 0;
+            debugEnabled_        = false;
+            enableTransitioning_ = false;
+            enableCv_.notify_all();
+        }
+        heldSession_.store(false);
+        {
             std::lock_guard<std::mutex> lk(clientMtx_);
             clientSock_ = nullptr;
         }
@@ -294,17 +303,8 @@ namespace MCDevTool::Safaia {
         state_.setConnected(true);
         clientConnected_.store(true);
 
-        // 首个 config 触发 enable 序列（独立线程，避免阻塞读循环）。
-        if (!enableSpawned_.exchange(true)) {
-            if (enableThread_.has_value()) {
-                // 理论上上一连接的 enable 线程已在断连清理时 join；防御性 detach。
-                if (enableThread_->joinable()) {
-                    enableThread_->detach();
-                }
-                enableThread_.reset();
-            }
-            enableThread_.emplace([this]() { runEnableSequence(); });
-        }
+        // 不在此自动启用 UI 调试：游戏默认保持正常交互；调试仅在 UI 调试工具调用期间
+        // 经 DebugSession 临时开启（beginDebugSession/endDebugSession）。
     }
 
     void SafaiaController::onCmdFrame(const std::string& payload) {
@@ -450,32 +450,78 @@ namespace MCDevTool::Safaia {
         return sendUidebuger("SetEnabled", nlohmann::json::array({enabled}));
     }
 
-    void SafaiaController::runEnableSequence() {
+    bool SafaiaController::performEnableAndWait() {
         // SetEnabled 无 ack：fire-and-forget，随后用 GetControlTree(handle=5) 作就绪信号。
+        // 兼作缓存预热（getControlTree 会缓存 "/" 树）。最多约 2s。
         setEnabled(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-        for (int attempt = 1; attempt <= cfg_.enableRetries; ++attempt) {
+        for (int i = 0; i < 8; ++i) {
             if (!clientConnected_.load() || !running_.load()) {
-                return;
+                return false;
             }
             RpcResult r = getControlTree("/");
             if (r.ok && r.handle == RPCHandles::GetControlTree && r.success) {
                 state_.setReady(true);
-                log("info", "Safaia: UI debugger ready (screen=" + state_.currentScreen() + ")");
-                return;
+                return true;
             }
             if (r.ok && r.handle == RPCHandles::NotEnabled) {
-                log("warn", "Safaia: NotEnabled, re-sending SetEnabled");
-                setEnabled(true);
-            } else {
-                log("info",
-                    "Safaia: enable attempt " + std::to_string(attempt) + " -> "
-                        + (r.timeout ? std::string("timeout") : r.handleName()));
+                setEnabled(true); // 重发
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(cfg_.enableRetryIntervalMs));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
-        log("warn", "Safaia: enable sequence exhausted; controller will keep listening for events");
+        return false;
+    }
+
+    bool SafaiaController::beginDebugSession() {
+        std::unique_lock<std::mutex> lk(enableMtx_);
+        ++enableRefCount_;
+        // 等待进行中的 enable/disable 过渡完成（另一个 begin/end）。
+        enableCv_.wait(lk, [&] { return !enableTransitioning_; });
+        if (debugEnabled_) {
+            return true; // 已启用，复用
+        }
+        enableTransitioning_ = true;
+        lk.unlock();
+
+        bool ready = performEnableAndWait();
+
+        lk.lock();
+        debugEnabled_        = true; // 已发出 enable（即便就绪探测超时也不反复重启）
+        enableTransitioning_ = false;
+        enableCv_.notify_all();
+        return ready;
+    }
+
+    void SafaiaController::endDebugSession() {
+        std::unique_lock<std::mutex> lk(enableMtx_);
+        if (enableRefCount_ > 0) {
+            --enableRefCount_;
+        }
+        if (enableRefCount_ != 0) {
+            return; // 仍有活跃会话，保持启用
+        }
+        enableCv_.wait(lk, [&] { return !enableTransitioning_; });
+        if (enableRefCount_ != 0 || !debugEnabled_) {
+            return; // 新会话已介入，或已关闭
+        }
+        enableTransitioning_ = true;
+        lk.unlock();
+
+        setEnabled(false); // fire-and-forget，游戏恢复正常交互
+
+        lk.lock();
+        debugEnabled_        = false;
+        state_.setReady(false);
+        enableTransitioning_ = false;
+        enableCv_.notify_all();
+    }
+
+    void SafaiaController::setDebugHeld(bool on) {
+        bool was = heldSession_.exchange(on);
+        if (on && !was) {
+            beginDebugSession(); // 持有一个不配对的引用，保持调试开启
+        } else if (!on && was) {
+            endDebugSession();   // 释放持有的引用
+        }
     }
 
 } // namespace MCDevTool::Safaia
