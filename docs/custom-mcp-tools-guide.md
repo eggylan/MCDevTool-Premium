@@ -1,7 +1,7 @@
 # 自定义 MCP 工具开发指南
 
 > 适用于 MCDK 的自定义 MCP 工具系统：用 `@mcp_tool` 装饰普通 Python 函数，mcdk 会把它注册成
-> **一等 MCP 工具**,Claude 等客户端可直接调用,支持热更新与项目级 / 全局两种作用域。
+> **一等 MCP 工具**,Agent 等客户端可直接调用,支持热更新与项目级 / 全局两种作用域。
 
 ---
 
@@ -13,7 +13,7 @@ Py2.7 函数并装饰它,mcdk 启动游戏后会:
 1. **发现**:扫描约定目录,把装饰过的函数收集进注册表;
 2. **上报**:经 IPC 把注册表交给 mcdk;
 3. **注册**:mcdk 把每个工具注册成独立的 MCP 工具(名称 / 描述 / 参数 schema 来自装饰器);
-4. **调用**:Claude 调用该工具 → mcdk 经 IPC 转发到游戏侧对应函数 → 返回值统一转成字符串回传。
+4. **调用**:Agent 调用该工具 → mcdk 经 IPC 转发到游戏侧对应函数 → 返回值统一转成字符串回传。
 
 与"在 `execute_code` 里写一大段代码"相比,自定义工具的优势是:**接口固定、参数有 schema、
 可复用、AI 可直接按名调用**,适合把高频调试 / 测试操作固化下来。
@@ -65,7 +65,7 @@ def get_player_position(player_id=None):
     return {"player_id": player_id, "pos": pos}   # 返回原生对象即可
 ```
 
-> **重要:`mcp_tool` 由扫描器自动注入到文件命名空间,不要 `import` 它。** 这些文件是被
+> **重要提示:`mcp_tool` 由扫描器自动注入到文件命名空间,不要 `import` 它。** 这些文件是被
 > `compile + exec`(注入装饰器)执行的,而不是当普通模块导入,因此相对 import 不可用。
 
 ### 2.3 让它生效
@@ -109,9 +109,9 @@ mcp_tool(name, description="", params=None, side="server")
 
 ---
 
-## 4. 返回值契约
+## 4. 返回值
 
-函数返回**原生对象即可**,框架在 MOD 侧统一转成字符串(`return_string`)再交给 AI,**永不抛异常**:
+函数返回**原生对象即可**,框架在 MOD 侧统一转成字符串(`return_string`)再交给 AI,**不抛异常**:
 
 | 返回类型 | 转换方式 |
 |---|---|
@@ -150,7 +150,7 @@ mcp_tool(name, description="", params=None, side="server")
 import mod.server.extraServerApi as serverApi
 
 
-@mcp_tool(name="count_loaded_entities", description="统计当前已加载实体数量", params=[], side="server")
+@mcp_tool(name="count_loaded_entities", description="统计当前已加载实体数量（不含玩家）", params=[], side="server")
 def count_loaded_entities():
     actors = serverApi.GetEngineActor() or {}
     return {"count": len(actors)}
@@ -170,19 +170,18 @@ import mod.client.extraClientApi as clientApi
     side="client",
 )
 def notify_player(msg=""):
-    import gui
-    gui.set_left_corner_notify_msg(msg)
+    comp = clientApi.GetEngineCompFactory().CreateTextNotifyClient(clientApi.GetLevelId())
+    comp.SetLeftCornerNotify(msg)
     return "ok: " + msg
 ```
 
-### 6.3 多参数 + 缓存工厂(推荐写法)
+### 6.3 多参数
 
 ```python
 # -*- coding: utf-8 -*-
 import mod.server.extraServerApi as serverApi
 
-_FACTORY = None  # 工厂惰性缓存,避免每次调用重建(性能规范)
-
+_FACTORY = None
 
 def _factory():
     global _FACTORY
@@ -199,12 +198,13 @@ def _factory():
         {"name": "x", "type": "number", "description": "X", "required": True},
         {"name": "y", "type": "number", "description": "Y", "required": True},
         {"name": "z", "type": "number", "description": "Z", "required": True},
+        {"name": "dimensionId", "type": "number", "description": "维度，0-overWorld; 1-nether; 2-theEnd", "required": True},
     ],
     side="server",
 )
-def teleport_player(player_id=None, x=0, y=0, z=0):
-    ok = _factory().CreatePos(str(player_id)).SetPos((float(x), float(y), float(z)))
-    return {"player_id": player_id, "pos": [x, y, z], "ok": bool(ok)}
+def teleport_player(player_id=None, x=0, y=0, z=0,dimensionId=0):
+    ok = _factory().CreateDimension(str(player_id)).ChangePlayerDimension(int(dimensionId), (int(x),int(y),int(z))
+    return {"player_id": player_id, "pos": [x, y, z],"dimensionId":dimensionId, "ok": bool(ok)}
 ```
 
 ---
@@ -267,7 +267,7 @@ def teleport_player(player_id=None, x=0, y=0, z=0):
 - 把某工具设为 `false` 即不注册该工具;未列出的工具默认启用。
 - 所有 `ui_*` 全部为 `false` 时,Safaia UI 调试控制器不会启动。
 - `custom_tools=false` 时,不发现/注册任何用户 `@mcp_tool` 工具,也不提供 `resync_custom_tools`。
-- **`health_check` 始终启用、不可关闭**,不出现在 `tools` 配置中(用于随时确认链路可用)。
+- **`health_check` 始终启用、不可关闭**,不出现在 `tools` 配置中。
 
 ---
 
@@ -290,8 +290,8 @@ def teleport_player(player_id=None, x=0, y=0, z=0):
 
 | 现象 | 排查 |
 |---|---|
-| 工具没出现在 `tools/list` | 调 `resync_custom_tools` 后 `/mcp` 重连;确认文件在 `mcp_tools/` 下且不以 `__` 开头;确认 `@mcp_tool` 的 `name` 没和别的工具重名。 |
-| 调用报 "game not connected" | 游戏没进世界 / 已退出,IPC 未连接。进游戏后重试。 |
-| 全局工具不生效 | 确认文件在 `%USERPROFILE%\.mcdk\mcp_tools\`;启动前就位才会在连接时自动发现,运行时新增需 `resync_custom_tools`;检查 `.mcdev.json` 未把 `global_mcp_tools_dir` 设为空串。 |
-| 改了函数体没变化 | 调 `resync_custom_tools`(它会重新 exec 文件);内置工具(`McpToolsBuiltin.py`)属于嵌入脚本,改它需重新编译 mcdk + 重启游戏,而 `mcp_tools/` 下的用户工具则可热更新。 |
-| 返回乱码 | 文件头加 `# -*- coding: utf-8 -*-`;中文返回值用 `unicode` 或确保 UTF-8。 |
+| 工具没出现在 `tools/list` | 调 `resync_custom_tools` 后 `/mcp` 重连;确认文件在 `mcp_tools/` 下且不以 `__` 开头;确认 `@mcp_tool` 的 `name` 没和别的工具重名 |
+| 调用报 "game not connected" | 游戏没进世界 / 已退出,IPC 未连接。进游戏后重试 |
+| 全局工具不生效 | 确认文件在 `%USERPROFILE%\.mcdk\mcp_tools\`;启动前就位才会在连接时自动发现,运行时新增需 `resync_custom_tools`;检查 `.mcdev.json` 未把 `global_mcp_tools_dir` 设为空串 |
+| 改了函数体没变化 | 调 `resync_custom_tools`(它会重新 exec 文件);内置工具(`McpToolsBuiltin.py`)属于嵌入脚本,改它需重新编译 mcdk + 重启游戏,而 `mcp_tools/` 下的用户工具则可热更新 |
+| 返回乱码 | 文件头加 `# -*- coding: utf-8 -*-` |

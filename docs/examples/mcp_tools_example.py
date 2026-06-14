@@ -8,12 +8,10 @@
 #
 # 注意:
 #   - mcp_tool 由扫描器自动注入命名空间,无需 import。
-#   - 这些工具原是 MCDK 早期内置示例,现改为开发者按需自取的范例。
 import mod.server.extraServerApi as serverApi
 import mod.client.extraClientApi as clientApi
 
 
-# ── 引擎组件工厂(惰性缓存,避免每次调用重建)──────────────────────
 _SR_FACTORY = None
 
 
