@@ -281,7 +281,11 @@ namespace MCDevTool::Safaia {
                 // 游戏侧心跳；接收即视为存活，无需回复（与 Python 探针一致）。
                 break;
             case MCProtocol::message:
-                // 游戏日志消息；P0 暂不消费。
+                // 游戏日志消息：原始 payload 交给 message handler(若已设置)，由其负责
+                // 流式分行/[Python] 过滤/颜色与错误分类/缓冲。未设置则静默丢弃，不影响 UI RPC。
+                if (messageFn_) {
+                    messageFn_(f.payload);
+                }
                 break;
             case MCProtocol::cmd:
                 onCmdFrame(f.payload);

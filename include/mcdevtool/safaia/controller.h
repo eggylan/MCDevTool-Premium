@@ -9,6 +9,7 @@
 #include "mcdevtool/safaia/discovery.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -48,6 +49,11 @@ namespace MCDevTool::Safaia {
     // 日志回调（可选）：level 为 "info"/"warn"/"error"。
     using SafaiaLogFn = std::function<void(const std::string& level, const std::string& msg)>;
 
+    // 游戏日志回调（可选）：MCProtocol::message(协议 4) 的原始 payload。
+    // 与 SafaiaLogFn(控制器自身连接/握手/错误日志)区分：此回调专用于转发游戏侧日志，
+    // controller 不在此做 [Python] 过滤、颜色判断或 MCP 缓冲(交由 GameLogProcessor)。
+    using SafaiaMessageFn = std::function<void(std::string_view payload)>;
+
     class SafaiaController {
     public:
         SafaiaController() = default;
@@ -58,6 +64,9 @@ namespace MCDevTool::Safaia {
 
         void configure(const SafaiaControllerConfig& cfg);
         void setLogger(SafaiaLogFn fn) { logFn_ = std::move(fn); }
+
+        // 设置游戏日志(协议 4)回调。未设置时静默丢弃协议 4，不影响 UI RPC。
+        void setMessageHandler(SafaiaMessageFn fn) { messageFn_ = std::move(fn); }
 
         // 启动 TCP server + UDP 发现；成功返回 true。
         bool start();
@@ -133,6 +142,7 @@ namespace MCDevTool::Safaia {
         UiDebugState           state_;
         DiscoverySender        discovery_;
         SafaiaLogFn            logFn_;
+        SafaiaMessageFn        messageFn_;
 
         void*      listenSock_ = nullptr;
         void*      clientSock_ = nullptr;
