@@ -1,18 +1,25 @@
 # MCDevTool Premium
+
+![image](./images/banner.webp)
+
 适用于**网易我的世界**的开发者工具包，提供创建测试世界、加载用户Mod等功能，方便开发者在脱离**mcs编辑器**的环境下离线测试Mod。
 
 由 EGGYLAN 基于 MCDevTool 开发，原仓库地址：[MCDevTool](https://github.com/GitHub-Zero123/MCDevTool)
 
 本工具保持开源、免费，切勿轻信虚假信息。本项目与原版MCDevTool无任何隶属关系。
 
-![image](./mods/demo2.webp)
+## 使用截图
 
-## 配置mcdk
+![image](./images/screenshot1.webp)
+
+![image](./images/demo2.webp)
+
+## 快速开始：配置mcdk
 您可以将**mcdk**添加到环境变量Path中，也可以直接放置在本地项目工作区以便命令搜索。
 
 > vscode[插件](https://marketplace.visualstudio.com/items?itemName=dofes.mcdev-tools)现已经上线，可直接使用插件一站式开发，无需额外配置。
 
-## 在vscode中使用
+## 在VS Code中使用
 您可以在**vscode**中配置任务以便直接运行**mcdk**，例如：
 
 ```jsonc
