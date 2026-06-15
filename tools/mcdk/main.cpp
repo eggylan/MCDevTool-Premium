@@ -31,6 +31,8 @@
 #include "modules/log_buffer.hpp"
 #include "modules/mcp_server.hpp"
 #include "modules/custom_tool_manager.hpp"
+#include "modules/game_log_processor.hpp"
+#include "modules/async_log_pump.hpp"
 
 
 // mcdevtool api
@@ -134,79 +136,7 @@ static void printColoredAtomic(const std::string& msg, ConsoleColor color) {
 }
 
 // 进程buffer行处理
-static void processBufferAppend(
-    std::string&                                   lineBuf,
-    const char*                                    buf,
-    size_t                                         len,
-    bool                                           filterPython,
-    const std::function<void(const std::string&)>& processLine
-) {
-    lineBuf.append(buf, len);
-
-    size_t pos = 0;
-    while ((pos = lineBuf.find('\n')) != std::string::npos) {
-        std::string line = lineBuf.substr(0, pos);
-        lineBuf.erase(0, pos + 1);
-
-        // 去除行尾可能存在的 '\r'
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-
-        // 过滤：若启用只保留 [Python] 则丢弃其它
-        if (filterPython && line.find("[Python] ") == std::string::npos) continue;
-
-        processLine(line);
-    }
-}
-
 #ifdef _WIN32
-
-// pipe线程处理函数
-static void
-readPipeThread(HANDLE hPipe, bool filterPython, const std::function<void(const std::string&)>& processLine) {
-    constexpr DWORD   BUFSZ = 4096;
-    std::string       lineBuf;
-    std::vector<char> buffer(BUFSZ);
-
-    while (true) {
-        DWORD bytesRead = 0;
-        BOOL  ok        = ReadFile(hPipe, buffer.data(), BUFSZ, &bytesRead, NULL);
-        if (!ok) {
-            DWORD err = GetLastError();
-            // ERROR_BROKEN_PIPE (109) 表示写端已关闭并读尽
-            if (err == ERROR_BROKEN_PIPE) {
-                // 处理残留并退出
-                if (!lineBuf.empty()) {
-                    // 没有换行但还有内容，作为最后一行处理
-                    std::string lastLine = lineBuf;
-                    if (!lastLine.empty() && lastLine.back() == '\r') lastLine.pop_back();
-                    if (!(filterPython && lastLine.find("[Python] ") == std::string::npos)) processLine(lastLine);
-                    lineBuf.clear();
-                }
-                break;
-            } else {
-                // 其它错误直接退出
-                break;
-            }
-        }
-
-        if (bytesRead == 0) {
-            // 管道关闭或无数据（通常与 ERROR_BROKEN_PIPE 一致）
-            // 处理残留并退出
-            if (!lineBuf.empty()) {
-                std::string lastLine = lineBuf;
-                if (!lastLine.empty() && lastLine.back() == '\r') lastLine.pop_back();
-                if (!(filterPython && lastLine.find("[Python] ") == std::string::npos)) processLine(lastLine);
-                lineBuf.clear();
-            }
-            break;
-        }
-
-        // 追加并按行处理（会把完整行交给 processLine，残留留在 lineBuf）
-        processBufferAppend(lineBuf, buffer.data(), bytesRead, filterPython, processLine);
-    }
-}
 
 // 尝试附加调试器到指定进程
 static void debuggerAttachToProcess(DWORD pid, int port) {
@@ -291,21 +221,54 @@ static void launchGameExe(
 ) {
     bool  autoHotReload = userConfig.value("auto_hot_reload_mods", true);
     bool  enableIPC     = autoHotReload;
-    bool  needLogBuffer = false;
     void* lpEnvironment = nullptr;
 
     auto mcpServerConfig = mcdk::getMcpServerConfigFromJson(userConfig);
+    auto safaiaSettings  = mcdk::getSafaiaUserSettingsFromJson(userConfig);
+    bool filterPython    = userConfig.value("include_debug_mod", true);
+
     auto ipcServer       = MCDevTool::Debug::createDebugServer();
     auto logBuffer       = std::make_shared<mcdk::LogBuffer>(1000, 250);
     auto errBuffer       = std::make_shared<mcdk::LogBuffer>(1000, 400);
     auto mcpServer       = mcdk::MCPServer(mcpServerConfig);
     auto safaiaController = std::make_shared<MCDevTool::Safaia::SafaiaController>();
     mcdk::CustomToolManager customToolManager;
+
+    // 游戏日志处理器：消费 Safaia 协议 4 的原始日志。控制台始终输出；仅 MCP 启用时
+    // 写入 log/err 缓冲(供 MCP 日志查询工具)。必须在注册 Safaia message handler 之前创建，
+    // 并存活到 controller 完全停止之后(见函数末尾 stop -> flush 顺序)。
+    auto gameLog = std::make_unique<mcdk::GameLogProcessor>(
+        filterPython,
+        logBuffer,
+        errBuffer,
+        [](const std::string& line, ConsoleColor color) { printColoredAtomic(line, color); },
+        mcpServerConfig.enabled // enableBuffering：MCP 关闭时不缓冲，但控制台仍输出
+    );
+    mcdk::GameLogProcessor* gameLogPtr = gameLog.get();
+
+    // 异步日志泵：Safaia recv 线程只入队原始 payload(post)，由 worker 线程调用 consume 做实际处理。
+    // 这样控制台/缓冲变慢也不会阻塞 recv 线程，避免反压游戏侧 Safaia 发送导致界面卡死。
+    auto logPump = std::make_unique<mcdk::AsyncLogPump>(
+        [gameLogPtr](std::string_view payload) { gameLogPtr->consume(payload); }
+    );
+    mcdk::AsyncLogPump* logPumpPtr = logPump.get();
+
+    // Safaia 控制器是日志基础组件：每次启动 Minecraft 都配置并(在拿到 PID 后)启动，
+    // 不依赖 mcp_server_config.enabled / ui_* / safaia_ui_debug.enabled。
+    safaiaController->configure(safaiaSettings.controller);
+    safaiaController->setLogger([](const std::string& level, const std::string& msg) {
+        ConsoleColor color = (level == "error")  ? ConsoleColor::Red
+                             : (level == "warn") ? ConsoleColor::Yellow
+                                                 : ConsoleColor::Cyan;
+        printColoredAtomic("[Safaia] " + msg, color);
+    });
+    // recv 线程仅入队，绝不在此做可能阻塞的处理(见 AsyncLogPump 注释)。
+    safaiaController->setMessageHandler([logPumpPtr](std::string_view payload) { logPumpPtr->post(payload); });
+
     if (mcpServerConfig.enabled) {
         // 若启用MCP服务器将自动启用IPC调试功能
         autoHotReload = true;
         enableIPC     = true;
-        needLogBuffer = true;
         printColoredAtomic(
             "[MCDK] MCP服务器已启用：" + mcpServerConfig.serverIp + ":" + std::to_string(mcpServerConfig.serverPort),
             ConsoleColor::Green
@@ -428,26 +391,12 @@ static void launchGameExe(
             return ipcServer->sendMessage(7, fileName); // ONCE SHADER RELOAD
         });
 
-        // ── Safaia UI 调试控制器（接管游戏内 UI Debugger，暴露 ui_* MCP 工具）──
-        // 仅当存在任一启用的 ui_* 工具时启动（受各 ui 工具单独开关 + safaia_ui_debug.enabled 约束）。
-        auto safaiaCfg    = mcdk::getSafaiaConfigFromJson(userConfig);
-        if (mcpServerConfig.anyUiDebugEnabled() && safaiaCfg.enabled) {
-            safaiaController->configure(safaiaCfg);
-            safaiaController->setLogger([](const std::string& level, const std::string& msg) {
-                ConsoleColor color = (level == "error")  ? ConsoleColor::Red
-                                     : (level == "warn") ? ConsoleColor::Yellow
-                                                         : ConsoleColor::Cyan;
-                printColoredAtomic("[Safaia] " + msg, color);
-            });
+        // ── Safaia UI 调试：仅把控制器暴露给 MCP 的 ui_* 工具 ──
+        // 控制器本身已在 MCP 块外配置并随 Minecraft 启动(日志基础组件)。这里只决定是否
+        // 注入给 UI 工具：需 MCP 启用 + 至少一个 ui_* 工具启用 + safaia_ui_debug.enabled。
+        // 不满足时控制器仍运行并接收日志，仅 UI 调试能力不可用。
+        if (mcpServerConfig.anyUiDebugEnabled() && safaiaSettings.uiDebugEnabled) {
             mcpServer.setSafaiaController(safaiaController);
-            if (safaiaController->start()) {
-                printColoredAtomic(
-                    "[MCDK] Safaia UI 调试控制器已启动（端口 " + std::to_string(safaiaController->boundPort()) + "）",
-                    ConsoleColor::Green
-                );
-            } else {
-                printColoredAtomic("[MCDK] Safaia UI 调试控制器启动失败（UI 调试工具将不可用）", ConsoleColor::Yellow);
-            }
         }
 
         // ── 自定义 MCP 工具管理器 ──
@@ -546,29 +495,24 @@ static void launchGameExe(
     sa.bInheritHandle       = TRUE;
     sa.lpSecurityDescriptor = nullptr;
 
-    // 创建 stdout/stderr 分开管道
-    HANDLE outRead = NULL, outWrite = NULL;
-    HANDLE errRead = NULL, errWrite = NULL;
-
-    if (!CreatePipe(&outRead, &outWrite, &sa, 0)) {
-        throw std::runtime_error("CreatePipe(stdout) failed");
-    }
-
-    if (!SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0)) {
-        throw std::runtime_error("SetHandleInformation(stdout) failed");
-    }
-
-    if (!CreatePipe(&errRead, &errWrite, &sa, 0)) {
-        throw std::runtime_error("CreatePipe(stderr) failed");
-    }
-
-    if (!SetHandleInformation(errRead, HANDLE_FLAG_INHERIT, 0)) {
-        throw std::runtime_error("SetHandleInformation(stderr) failed");
+    // 日志统一经 Safaia 协议 4 获取，不再使用 stdout/stderr 匿名管道。
+    // 将子进程 stdout/stderr 重定向到 NUL，避免继承控制台或无人读取的管道造成重复输出 / 缓冲区阻塞。
+    HANDLE hNul = CreateFileW(
+        L"NUL",
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sa,
+        OPEN_EXISTING,
+        0,
+        nullptr
+    );
+    if (hNul == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("CreateFileW(NUL) failed");
     }
 
     si.dwFlags    |= STARTF_USESTDHANDLES;
-    si.hStdOutput  = outWrite;
-    si.hStdError   = errWrite;
+    si.hStdOutput  = hNul;
+    si.hStdError   = hNul;
     si.hStdInput   = GetStdHandle(STD_INPUT_HANDLE);
 
     auto neteaseConfig = userConfig.value("netease_config", nlohmann::json::object());
@@ -607,10 +551,7 @@ static void launchGameExe(
             &si,
             &pi
         )) {
-        CloseHandle(outRead);
-        CloseHandle(outWrite);
-        CloseHandle(errRead);
-        CloseHandle(errWrite);
+        CloseHandle(hNul);
         throw std::runtime_error("CreateProcessA failed");
     }
 
@@ -619,82 +560,23 @@ static void launchGameExe(
     styleProcessor.setPid(pid);
     mcpServer.setMinecraftProcessId(pid);
 
-    // 父进程不需要写端
-    CloseHandle(outWrite);
-    CloseHandle(errWrite);
+    // 父进程不需要 NUL 句柄
+    CloseHandle(hNul);
 
-    // 输出处理回调
-    auto processStdout = [needLogBuffer, logBuffer](const std::string& line) {
-        // 屏蔽 Engine 噪音行
-        if (line.find(" [INFO][Engine] ") != std::string::npos) {
-            return;
-        }
-        // 特殊标记行处理
-        if (line.find("[INFO][Developer]") != std::string::npos) {
-            printColoredAtomic(line, ConsoleColor::DarkGray);
-            return;
-        } else if (mcdk::containsIgnoreCase(line, "SUC")) {
-            printColoredAtomic(line, ConsoleColor::Green);
-            return;
-        } else if (mcdk::containsIgnoreCase(line, "ERROR")) {
-            printColoredAtomic(line, ConsoleColor::Red);
-            return;
-        } else if (mcdk::containsIgnoreCase(line, "WARN")) {
-            printColoredAtomic(line, ConsoleColor::Yellow);
-            return;
-        } else if (mcdk::containsIgnoreCase(line, "DEBUG")) {
-            printColoredAtomic(line, ConsoleColor::Cyan);
-            return;
-        }
-        printColoredAtomic(line, ConsoleColor::Default);
-        if (needLogBuffer) {
-            logBuffer->add(std::move(line));
-        }
-    };
-
-    // stderr 处理回调
-    auto processStderr = [needLogBuffer, logBuffer, errBuffer](const std::string& line) {
-        static std::regex fileRe(R"(File \"([A-Za-z0-9_\.]+)\", line (\d+))");
-
-        std::string out;
-        out.reserve(line.size());
-
-        std::sregex_iterator cur(line.begin(), line.end(), fileRe);
-        std::sregex_iterator end;
-
-        size_t lastPos = 0;
-
-        for (; cur != end; ++cur) {
-            const std::smatch& m = *cur;
-
-            // 追加前面的普通内容
-            out.append(line, lastPos, m.position() - lastPos);
-
-            // 动态构造替换内容
-            std::string dotted  = m[1].str();
-            std::string slashed = dotted;
-            std::replace(slashed.begin(), slashed.end(), '.', '/');
-            slashed += ".py";
-
-            out += "File \"" + slashed + "\", line " + m[2].str();
-
-            lastPos = m.position() + m.length();
-        }
-
-        // 拼接剩余部分
-        out.append(line, lastPos);
-
-        printColoredAtomic(out, ConsoleColor::Red);
-        if (needLogBuffer) {
-            logBuffer->add(out);
-            errBuffer->add(std::move(out));
-        }
-    };
+    // ── 启动 Safaia 控制器：拿到 PID 后再启动 TCP server + PID 定向 discovery ──
+    // 控制器是日志基础组件，与 MCP/UI 无关；失败只警告，不阻止游戏与其他功能。
+    safaiaController->setMinecraftPid(pid);
+    if (safaiaController->start()) {
+        printColoredAtomic(
+            "[MCDK] Safaia 日志控制器已启动（端口 " + std::to_string(safaiaController->boundPort()) + "）",
+            ConsoleColor::Green
+        );
+    } else {
+        printColoredAtomic("[MCDK] Safaia 日志控制器启动失败，Minecraft 日志不可用", ConsoleColor::Yellow);
+    }
 
     // ===================== 用户配置后置处理 =====================
-    // 是否过滤非Python输出
-    bool filterPython = userConfig.value("include_debug_mod", true);
-    // 调试器端口（0为不启用）
+    // 旧版 mcdbg 调试器端口（0为不启用；modpc_debugger 为历史兼容方案，见 README）
     int debuggerPort = mcdk::getEnvDebuggerPort();
     if (debuggerPort == 0) {
         // 解析用户配置覆盖
@@ -706,11 +588,6 @@ static void launchGameExe(
             }
         }
     }
-
-    // 启动两个线程并行读取（避免任何死锁）
-    std::thread tOut(readPipeThread, outRead, filterPython, std::function<void(const std::string&)>(processStdout));
-
-    std::thread tErr(readPipeThread, errRead, filterPython, std::function<void(const std::string&)>(processStderr));
 
     if (debuggerPort > 0) {
         // 尝试启动mcdbg调试器附加（在官方调试器之前的历史产物）
@@ -732,9 +609,15 @@ static void launchGameExe(
     }
     styleProcessor.start();
 
-    // 等待子进程退出（子进程退出后会关闭写端，使 ReadFile 返回
-    // ERROR_BROKEN_PIPE）
+    // 等待子进程退出
     WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // 先停止 Safaia 控制器，确保其读线程不再 post 新日志，再排空异步泵、flush 残行。
+    safaiaController->stop();
+    // 处理完队列中已入队的剩余日志后退出 worker。
+    logPump->stop();
+    // 处理最后一个无换行残行（断连/退出时）。
+    gameLog->flush();
 
     // 停止热更新任务
     reloadTask.safeExit();
@@ -742,19 +625,10 @@ static void launchGameExe(
     ipcServer->safeExit();
     // 停止样式处理器
     styleProcessor.safeExit();
-    // 停止 Safaia UI 调试控制器（如已启用）
-    safaiaController->stop();
     // 停止自定义工具管理器（如已启用）
     customToolManager.stop();
     // 安全的关闭MCP服务器(如果已启用)
     mcpServer.stop();
-
-    // 等待读线程退出并关闭读端句柄
-    tOut.join();
-    tErr.join();
-
-    CloseHandle(outRead);
-    CloseHandle(errRead);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);

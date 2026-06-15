@@ -309,8 +309,6 @@ namespace MCDevTool::Safaia {
     }
 
     void SafaiaController::onConfig(const nlohmann::json& cfg) {
-        std::string name = cfg.is_object() ? cfg.value("name", std::string{}) : std::string{};
-
         // 解析 connect_port(游戏自身的 Safaia UDP 监听端口)。可能是整数或字符串。
         int connectPort = 0;
         if (cfg.is_object() && cfg.contains("connect_port")) {
@@ -326,15 +324,27 @@ namespace MCDevTool::Safaia {
             }
         }
 
+        // 仅当存在 connect_port 时才是「连接握手」config。游戏在握手后还会发送一个全量配置
+        // config(含 name/platform/com_netease_path 等，但不含 connect_port)用于上报元数据——
+        // 这与官方 Safaia server 一致(官方仅在 connect_id+connect_port 同时存在时握手，
+        // 从不因缺失 connect_port 而拒绝)。对这类次要 config 必须直接忽略：
+        // 不重新握手、不做归属校验、绝不发送 connect_block 关闭连接。
+        // (历史回归：曾对每个 config 都做 connect_port 归属校验，导致第二个全量 config 被误判为
+        //  非目标实例而 connect_block，恰在世界进入时切断连接，造成游戏界面卡死。)
+        if (connectPort == 0) {
+            return;
+        }
+
+        std::string name = cfg.is_object() ? cfg.value("name", std::string{}) : std::string{};
+
         // ── 多实例归属校验(第二道防线，不仅依赖 discovery 定向)──
         // 仅在已知目标 PID 时启用；connect_port 必须属于该 PID 当前拥有的 Safaia UDP 端口集合。
         uint32_t pid = minecraftPid_.load();
         if (pid != 0) {
             std::vector<uint16_t> ownedPorts = findSafaiaUdpPortsForProcess(pid);
-            bool                  owned      = connectPort != 0
-                       && std::find(ownedPorts.begin(), ownedPorts.end(),
-                                    static_cast<uint16_t>(connectPort))
-                              != ownedPorts.end();
+            bool                  owned =
+                std::find(ownedPorts.begin(), ownedPorts.end(), static_cast<uint16_t>(connectPort))
+                != ownedPorts.end();
             if (!owned) {
                 // 拒绝：回 connect_block，标记需断开。不置连接、不更新 UI、不触发日志回调。
                 log("warn",

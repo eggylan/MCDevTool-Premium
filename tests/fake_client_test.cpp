@@ -417,6 +417,64 @@ static void testRejectWrongPort() {
     ctrl.stop();
 }
 
+// ───────────── 子测试 3：握手后的次要 config(无 connect_port) 必须被忽略而非断连 ─────────────
+// 回归防护：游戏握手成功后会再发一个全量 config(name/platform/com_netease_path，无 connect_port)。
+// controller 必须忽略它，连接保持，日志继续路由——而不是误判为非目标实例 connect_block 断连。
+static void testSecondConfigIgnored() {
+    std::mutex               mtx;
+    std::vector<std::string> log;
+
+    SafaiaController ctrl;
+    ctrl.configure(makeCfg());
+    // 不设置 targetPid(=0)：握手不做归属校验，专注验证 config 处理本身。
+    ctrl.setMessageHandler([&](std::string_view s) {
+        std::lock_guard<std::mutex> lk(mtx);
+        log.emplace_back(s);
+    });
+    CHECK(ctrl.start());
+
+    SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    CHECK(tcp != INVALID_SOCKET);
+    sockaddr_in srv{};
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(static_cast<u_short>(ctrl.boundPort()));
+    inet_pton(AF_INET, "127.0.0.1", &srv.sin_addr);
+    CHECK(connect(tcp, reinterpret_cast<sockaddr*>(&srv), sizeof(srv)) != SOCKET_ERROR);
+
+    // 握手 config(含 connect_port)。
+    sendFrame(tcp, MCProtocol::config,
+              nlohmann::json{{"connect_id", "x"}, {"connect_port", 26614}, {"name", "x"}});
+    ProtocolFramer     framer;
+    std::vector<Frame> pending;
+    CHECK(waitFrame(tcp, framer, pending, 4000) == MCProtocol::connect_success);
+    CHECK(waitUntil([&]() { return ctrl.isConnected(); }, 3000));
+
+    // 第二个全量 config(无 connect_port) —— 必须被忽略，连接不得断开。
+    sendFrame(tcp, MCProtocol::config,
+              nlohmann::json{{"name", "laptop"}, {"platform", "windows"}, {"f_port", 2278},
+                             {"com_netease_path", "C:/x"}});
+    // 之后再发协议 4，确认连接仍在、日志仍路由。
+    sendAll(tcp, ProtocolFramer::pack(MCProtocol::message, "[Python] RAW_AFTER2ND\n"));
+
+    bool routed = waitUntil(
+        [&]() {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (auto& l : log) {
+                if (l.find("AFTER2ND") != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        3000
+    );
+    CHECK(routed);
+    CHECK(ctrl.isConnected());
+
+    closesocket(tcp);
+    ctrl.stop();
+}
+
 int main(int argc, char** argv) {
     if (argc >= 5 && std::string(argv[1]) == "--fake-mc") {
         uint16_t    port   = static_cast<uint16_t>(std::stoi(argv[2]));
@@ -430,6 +488,7 @@ int main(int argc, char** argv) {
 
     testIsolationRoutingResume();
     testRejectWrongPort();
+    testSecondConfigIgnored();
 
     WSACleanup();
 

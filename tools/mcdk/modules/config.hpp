@@ -145,6 +145,41 @@ namespace mcdk {
         return cfg;
     }
 
+    // Safaia 用户设置：明确拆分「控制器(日志基础组件，始终运行)」与「UI 调试能力开关」。
+    // - controller：每次启动 Minecraft 都配置并启动，作为唯一日志来源(Safaia 协议 4)。
+    //   其 enabled 强制为 true，不受 safaia_ui_debug.enabled / MCP / ui_* 约束。
+    // - uiDebugEnabled：仅控制是否把控制器暴露给 MCP 的 ui_* 工具(见 main.cpp)。
+    struct SafaiaUserSettings {
+        bool                                      uiDebugEnabled = true;
+        MCDevTool::Safaia::SafaiaControllerConfig controller;
+    };
+
+    // 解析 safaia_ui_debug 段为 SafaiaUserSettings。safaia_ui_debug.enabled 现在仅表示
+    // “UI 调试能力是否开启”，不再决定控制器是否运行(控制器始终运行)。
+    inline SafaiaUserSettings getSafaiaUserSettingsFromJson(const nlohmann::json& userConfig) {
+        SafaiaUserSettings s;
+        s.controller.enabled = true; // 控制器始终启动(日志基础组件)
+        auto j               = userConfig.value("safaia_ui_debug", nlohmann::json::object());
+        if (j.is_object()) {
+            s.uiDebugEnabled                     = j.value("enabled", true);
+            s.controller.bindIp                  = j.value("bind_ip", std::string("0.0.0.0"));
+            s.controller.bindPort                = j.value("bind_port", 0);
+            s.controller.advertiseIp             = j.value("advertise_ip", std::string("127.0.0.1"));
+            s.controller.discoveryIntervalMs     = j.value("discovery_interval_ms", 500);
+            s.controller.rpcTimeoutMs            = j.value("rpc_timeout_ms", 5000);
+            s.controller.enableRetries           = j.value("enable_retries", 6);
+            s.controller.enableRetryIntervalMs   = j.value("enable_retry_interval_ms", 1500);
+            if (j.contains("target_ips") && j["target_ips"].is_array()) {
+                for (const auto& ip : j["target_ips"]) {
+                    if (ip.is_string()) {
+                        s.controller.targetIps.push_back(ip.get<std::string>());
+                    }
+                }
+            }
+        }
+        return s;
+    }
+
     // 尝试更新游戏路径
     inline bool updateGamePath(std::filesystem::path& path) {        auto autoExePath = MCDevTool::autoMatchLatestGameExePath();
         if (autoExePath.has_value()) {
