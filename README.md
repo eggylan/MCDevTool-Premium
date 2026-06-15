@@ -1,9 +1,9 @@
 # MCDevTool Premium
 适用于**网易我的世界**的开发者工具包，提供创建测试世界、加载用户Mod等功能，方便开发者在脱离**mcs编辑器**的环境下离线测试Mod。
 
-基于MCDevTool开发，原仓库地址：[MCDevTool](https://github.com/GitHub-Zero123/MCDevTool)
+由 EGGYLAN 基于 MCDevTool 开发，原仓库地址：[MCDevTool](https://github.com/GitHub-Zero123/MCDevTool)
 
-本工具保持开源、免费，切勿轻信虚假信息。
+本工具保持开源、免费，切勿轻信虚假信息。本项目与原版MCDevTool无任何隶属关系。
 
 ![image](./mods/demo2.webp)
 
@@ -57,18 +57,70 @@
 }
 ```
 
-## vscode断点调试
-您可以通过配置**launch.json**以便在**vscode**中调试Mod代码，例如：
+## vscode断点调试（官方 ptvsd / debugpy，推荐）
+
+推荐使用游戏内置的官方 `ptvsd_debugger` 配合 VS Code 的 `debugpy` 远程附加，**无需 `mcdbg.exe`**。
+
+1. 安装 VS Code 的 Python 扩展。
+2. 在 `.mcdev.json` 启用 `ptvsd_debugger`：
+
+```jsonc
+"ptvsd_debugger": {
+    "enabled": true,
+    "ip": "127.0.0.1",
+    "port": 56788
+}
+```
+
+3. 配置 `.vscode/launch.json`：
 
 ```jsonc
 // .vscode/launch.json
-// 注：断点支持依赖mcdbg后端，需要在mcdev.json文件中配置启用，另见debugger/README.md
 {
     "version": "0.2.0",
     "configurations": [
         {
-            // 可通过F5快捷键启动调试器附加
-            "name": "Minecraft Modpc Debugger",
+            "name": "Attach Minecraft Mod (Official ptvsd)",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": {
+                "host": "127.0.0.1",
+                "port": 56788
+            },
+            "pathMappings": [
+                {
+                    "localRoot": "${workspaceFolder}",
+                    "remoteRoot": "${workspaceFolder}"
+                }
+            ],
+            "justMyCode": false
+        }
+    ]
+}
+```
+
+4. 启动 mcdk，等待控制台出现 `ptvsd 调试已启用`。
+5. 在 VS Code 运行上面的 attach 配置，端口须与 `.mcdev.json` 一致。
+
+也可用环境变量覆盖 `.mcdev.json`（两者同时设置时启用并覆盖）：
+
+- `MCDEV_PTVSD_IP`
+- `MCDEV_PTVSD_PORT`
+
+### 旧版 mcdbg 断点调试（兼容方案，不推荐新项目）
+
+`modpc_debugger` 是旧版注入式调试方案：mcdk 会执行 `mcdbg.exe --pid <pid> --port <port>`，默认端口 `5632`，需自行确保 `mcdbg.exe` 可被找到（另见 `debugger/README.md`）。
+
+- 不推荐新项目使用，建议改用官方 `ptvsd_debugger`。
+- **不能与 `ptvsd_debugger` 同时启用。**
+
+```jsonc
+// .vscode/launch.json（旧版 mcdbg，端口 5632）
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Minecraft Modpc Debugger (legacy mcdbg)",
             "type": "debugpy",
             "request": "attach",
             "connect": {
@@ -157,7 +209,14 @@ MCDEV配置文件，若不存在字段将以此处默认值为基准。
         "slim": false,
         "skin": "完整贴图路径.png"
     },
-    // MODPC调试器配置（依赖mcdbg后端，请确保配置在环境变量/当前工作区）
+    // 官方 ptvsd 调试器配置（推荐：游戏内置 ptvsd + VS Code debugpy 附加，无需 mcdbg）
+    // 也可用环境变量 MCDEV_PTVSD_IP / MCDEV_PTVSD_PORT 覆盖。不能与 modpc_debugger 同时启用。
+    "ptvsd_debugger": {
+        "enabled": false,       // 默认不启用
+        "ip": "127.0.0.1",
+        "port": 56788           // 端口号（需要在 vscode launch.json 中同步）
+    },
+    // 旧版 MODPC 调试器配置（兼容方案，依赖 mcdbg.exe，不推荐；不能与 ptvsd_debugger 同时启用）
     "modpc_debugger": {
         // 注：若使用插件一站式解决方案则通常不需要启用此选项，由插件自动管理
         "enabled": false,   // 默认不启用
@@ -196,6 +255,10 @@ MCDEV配置文件，若不存在字段将以此处默认值为基准。
     "netease_config": {
         // 是否启用聊天扩展功能（nethard魔改的游戏聊天界面）
         "chat_extension": false
+    },
+    // Safaia UI 调试控制器配置
+    "safaia_ui_debug": {
+        "enabled": true
     },
     // MCP服务器配置项
     "mcp_server_config": {
@@ -300,7 +363,7 @@ UI 调试模式默认关闭，普通点击仍按正常游戏交互执行。读�
 ui_set_debug_enabled(enabled=false)
 ```
 
-也可以对每个 `ui_*` 工具使用 `.mcdev.json` 中同名的 `mcp_server_config.tools` 开关。所有 UI 调试工具均关闭时，Safaia 控制器不会启动。
+也可以对每个 `ui_*` 工具使用 `.mcdev.json` 中同名的 `mcp_server_config.tools` 开关。
 
 推荐的排查流程：
 
@@ -308,6 +371,18 @@ ui_set_debug_enabled(enabled=false)
 2. 使用 `ui_control_get_data` 检查控件属性；
 3. 使用 `ui_locate_control` 配合 `capture_game_window` 做视觉确认；
 4. 调试完成后关闭 UI 调试模式，恢复正常操作。
+
+## 日志与多实例
+
+- Minecraft 日志由 MCDK Premium 内置的 Safaia 控制器经 **Safaia 协议（协议号 4）** 接收，不再沿用原版mcdk的 stdout/stderr 管道。
+- Safaia 控制器随 MCDK Premium 启动 Minecraft 一起启动，是**日志基础组件**，不依赖 `mcp_server_config.enabled`、任意 `ui_*` 工具或 `safaia_ui_debug.enabled`。
+  - 关闭全部 `ui_*` 工具：只关闭 UI 调试能力，控制台日志仍正常。
+  - `safaia_ui_debug.enabled=false`：只关闭 UI 调试能力，不关闭日志。
+  - MCP 服务器关闭时：Safaia 日志仍显示在 mcdk 控制台（仅不写入供 MCP 查询的缓冲）。
+- `get_latest_error_logs` 是**按内容分类**的错误日志（命中 `[ERROR]`/`[FATAL]` 及完整 Python traceback 块），不等价于 stderr 流。
+- Safaia 握手成功前产生的**极早期日志可能无法捕获**；握手后的 Mod 加载与运行期日志正常显示。
+- **同一个 Minecraft 不要同时连接官方调试器（MC Studio）**；MCDK Premium 与官方调试器不支持同时接管同一实例的 UI Debugger 通道。
+- 支持在同一台 Windows 主机同时运行多个 mcdk/Minecraft 实例：每个 mcdk 通过**目标 Minecraft 的 PID 及其占用的 Safaia UDP 端口（26613..26622）** 定向发现并校验握手，确保日志与 UI 控制不会串台到其它实例。
 
 ## 自定义 MCP 工具
 
