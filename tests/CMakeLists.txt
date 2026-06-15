@@ -25,3 +25,13 @@ target_link_libraries(captureTest PRIVATE mcdevtool)
 add_executable(game_log_processor_test game_log_processor_test.cpp)
 target_compile_features(game_log_processor_test PRIVATE cxx_std_23)
 target_include_directories(game_log_processor_test PRIVATE ${CMAKE_SOURCE_DIR}/tools/mcdk)
+
+# findSafaiaUdpPortsForProcess(PID->UDP端口)测试，需要 mcdevtool。
+add_executable(pid_port_query_test pid_port_query_test.cpp)
+target_compile_features(pid_port_query_test PRIVATE cxx_std_23)
+target_link_libraries(pid_port_query_test PRIVATE mcdevtool)
+
+# SafaiaController fake-client 多实例隔离测试，需要 mcdevtool。
+add_executable(fake_client_test fake_client_test.cpp)
+target_compile_features(fake_client_test PRIVATE cxx_std_23)
+target_link_libraries(fake_client_test PRIVATE mcdevtool)

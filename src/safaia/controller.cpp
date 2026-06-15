@@ -1,6 +1,8 @@
 #include "mcdevtool/safaia/controller.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -84,6 +86,7 @@ namespace MCDevTool::Safaia {
             targets = enumerateLocalIPv4();
         }
         discovery_.configure(cfg_.advertiseIp, boundPort_, targets, cfg_.discoveryIntervalMs);
+        discovery_.setLogger([this](const std::string& level, const std::string& msg) { log(level, msg); });
         discovery_.start();
 
         running_.store(true);
@@ -111,6 +114,7 @@ namespace MCDevTool::Safaia {
             }
             char ipbuf[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &cliAddr.sin_addr, ipbuf, sizeof(ipbuf));
+            lastClientIp_ = ipbuf;
             log("info", std::string("Safaia: game connected from ") + ipbuf);
             handleClient(reinterpret_cast<void*>(cli));
             log("info", "Safaia: game disconnected; waiting for reconnect");
@@ -131,8 +135,9 @@ namespace MCDevTool::Safaia {
         framer_.reset();
         drainResponses();
         enableSpawned_.store(false);
-        clientConnected_.store(true);
-        state_.setConnected(true);
+        clientRejected_.store(false);
+        // 不在此乐观置连接：等待 config 握手通过归属校验后(onConfig)再标记已连接，
+        // 以满足多实例隔离(错误实例的连接不得被视为已连接、不得触发日志/UI 回调)。
 
         std::vector<uint8_t> buf(8192);
         while (running_.load()) {
@@ -141,6 +146,9 @@ namespace MCDevTool::Safaia {
                 auto frames = framer_.input(buf.data(), static_cast<size_t>(n));
                 for (const auto& f : frames) {
                     onFrame(f);
+                }
+                if (clientRejected_.load()) {
+                    break; // 握手归属校验失败：已回 connect_block，主动断开。
                 }
             } else if (n == 0) {
                 break; // 对端正常关闭
@@ -156,6 +164,8 @@ namespace MCDevTool::Safaia {
         // ── 断连清理 ──
         clientConnected_.store(false);
         state_.resetForDisconnect();
+        // 恢复 PID 定向 discovery，等待目标实例重连(握手成功时会再次暂停)。
+        discovery_.setPaused(false);
         {
             // 复位按需启用状态，唤醒可能等待过渡的 begin/end；下次连接从“关闭”重新开始。
             std::lock_guard<std::mutex> lk(enableMtx_);
@@ -281,9 +291,9 @@ namespace MCDevTool::Safaia {
                 // 游戏侧心跳；接收即视为存活，无需回复（与 Python 探针一致）。
                 break;
             case MCProtocol::message:
-                // 游戏日志消息：原始 payload 交给 message handler(若已设置)，由其负责
-                // 流式分行/[Python] 过滤/颜色与错误分类/缓冲。未设置则静默丢弃，不影响 UI RPC。
-                if (messageFn_) {
+                // 游戏日志消息：仅在握手通过(已连接)后转发原始 payload，避免被拒绝实例的日志串台。
+                // 由 message handler 负责流式分行/[Python] 过滤/颜色与错误分类/缓冲。未设置则静默丢弃。
+                if (clientConnected_.load() && messageFn_) {
                     messageFn_(f.payload);
                 }
                 break;
@@ -300,12 +310,50 @@ namespace MCDevTool::Safaia {
 
     void SafaiaController::onConfig(const nlohmann::json& cfg) {
         std::string name = cfg.is_object() ? cfg.value("name", std::string{}) : std::string{};
+
+        // 解析 connect_port(游戏自身的 Safaia UDP 监听端口)。可能是整数或字符串。
+        int connectPort = 0;
+        if (cfg.is_object() && cfg.contains("connect_port")) {
+            const auto& cp = cfg["connect_port"];
+            if (cp.is_number_integer()) {
+                connectPort = cp.get<int>();
+            } else if (cp.is_string()) {
+                try {
+                    connectPort = std::stoi(cp.get<std::string>());
+                } catch (...) {
+                    connectPort = 0;
+                }
+            }
+        }
+
+        // ── 多实例归属校验(第二道防线，不仅依赖 discovery 定向)──
+        // 仅在已知目标 PID 时启用；connect_port 必须属于该 PID 当前拥有的 Safaia UDP 端口集合。
+        uint32_t pid = minecraftPid_.load();
+        if (pid != 0) {
+            std::vector<uint16_t> ownedPorts = findSafaiaUdpPortsForProcess(pid);
+            bool                  owned      = connectPort != 0
+                       && std::find(ownedPorts.begin(), ownedPorts.end(),
+                                    static_cast<uint16_t>(connectPort))
+                              != ownedPorts.end();
+            if (!owned) {
+                // 拒绝：回 connect_block，标记需断开。不置连接、不更新 UI、不触发日志回调。
+                log("warn",
+                    "Safaia: 拒绝非目标实例连接(来源 " + lastClientIp_ + ", connect_port "
+                        + std::to_string(connectPort) + " 不属于目标 PID " + std::to_string(pid) + ")");
+                sendFrame(MCProtocol::connect_block, nlohmann::json{{"notify", "notify_block"}});
+                clientRejected_.store(true);
+                return;
+            }
+        }
+
         log("info", "Safaia: config handshake from game" + (name.empty() ? std::string{} : (" (" + name + ")")));
 
         // 回复 connect_success（48）。
         sendFrame(MCProtocol::connect_success, nlohmann::json{{"notify", "pass"}});
         state_.setConnected(true);
         clientConnected_.store(true);
+        // 握手通过：暂停 discovery，目标实例已建立连接。
+        discovery_.setPaused(true);
 
         // 不在此自动启用 UI 调试：游戏默认保持正常交互；调试仅在 UI 调试工具调用期间
         // 经 DebugSession 临时开启（beginDebugSession/endDebugSession）。

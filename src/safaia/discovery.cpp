@@ -71,6 +71,41 @@ namespace MCDevTool::Safaia {
 
     DiscoverySender::~DiscoverySender() { stop(); }
 
+    std::vector<uint16_t> findSafaiaUdpPortsForProcess(uint32_t pid) {
+        std::vector<uint16_t> ports;
+        if (pid == 0) {
+            return ports;
+        }
+
+        ULONG size = 0;
+        DWORD ret  = GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if (ret != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+            return ports;
+        }
+        std::vector<BYTE> buf(size);
+        ret = GetExtendedUdpTable(buf.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if (ret != NO_ERROR) {
+            return ports;
+        }
+
+        auto*              table = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buf.data());
+        std::set<uint16_t> seen;
+        for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+            const MIB_UDPROW_OWNER_PID& row = table->table[i];
+            if (row.dwOwningPid != pid) {
+                continue;
+            }
+            // dwLocalPort 为网络字节序，存于低 16 位。
+            uint16_t port = ntohs(static_cast<u_short>(row.dwLocalPort & 0xFFFF));
+            if (port >= ConstPort::client_listen_base
+                && port < ConstPort::client_listen_base + ConstPort::client_listen_count) {
+                seen.insert(port);
+            }
+        }
+        ports.assign(seen.begin(), seen.end()); // std::set 已升序去重
+        return ports;
+    }
+
     void DiscoverySender::configure(
         std::string advertiseIp, int advertisePort, std::vector<std::string> targetIps, int intervalMs
     ) {
@@ -104,26 +139,55 @@ namespace MCDevTool::Safaia {
         const std::string payload = buildDiscoveryPayload(advertiseIp_, advertisePort_);
         SOCKET            sock     = reinterpret_cast<SOCKET>(sockPtr_);
 
-        while (active_.load()) {
+        const auto startTime    = std::chrono::steady_clock::now();
+        bool       warnedNoPort = false;
+
+        // 向单个端口的所有 targetIps 发送一次 discovery。
+        auto sendToPort = [&](u_short port) {
             for (const auto& ip : targetIps_) {
                 sockaddr_in dst{};
                 dst.sin_family = AF_INET;
                 if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) != 1) {
                     continue;
                 }
-                for (int i = 0; i < ConstPort::client_listen_count; ++i) {
-                    dst.sin_port = htons(static_cast<u_short>(ConstPort::client_listen_base + i));
-                    sendto(
-                        sock,
-                        payload.data(),
-                        static_cast<int>(payload.size()),
-                        0,
-                        reinterpret_cast<sockaddr*>(&dst),
-                        sizeof(dst)
-                    );
+                dst.sin_port = htons(port);
+                sendto(
+                    sock,
+                    payload.data(),
+                    static_cast<int>(payload.size()),
+                    0,
+                    reinterpret_cast<sockaddr*>(&dst),
+                    sizeof(dst)
+                );
+            }
+        };
+
+        while (active_.load()) {
+            if (!paused_.load()) {
+                uint32_t pid = targetPid_.load();
+                if (pid == 0) {
+                    // 未接入目标 PID：退回旧行为，向全部 26613..26622 广播。
+                    for (int i = 0; i < ConstPort::client_listen_count; ++i) {
+                        sendToPort(static_cast<u_short>(ConstPort::client_listen_base + i));
+                    }
+                    sentCount_.fetch_add(1);
+                } else {
+                    // PID 定向：仅向目标进程当前拥有的匹配端口发送，没有匹配端口时不广播。
+                    std::vector<uint16_t> ports = findSafaiaUdpPortsForProcess(pid);
+                    if (!ports.empty()) {
+                        for (uint16_t p : ports) {
+                            sendToPort(static_cast<u_short>(p));
+                        }
+                        sentCount_.fetch_add(1);
+                    } else if (!warnedNoPort
+                               && std::chrono::steady_clock::now() - startTime >= std::chrono::seconds(10)) {
+                        log("warn",
+                            "Safaia: 目标 Minecraft(PID " + std::to_string(pid)
+                                + ") 的 Safaia UDP 端口(26613..26622)10 秒内未出现，将继续后台查询");
+                        warnedNoPort = true;
+                    }
                 }
             }
-            sentCount_.fetch_add(1);
             std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs_));
         }
     }
@@ -148,6 +212,8 @@ namespace MCDevTool::Safaia {
 #else // 非 Windows：可移植桩，保证 mcdevtool 库可链接（不会在非 Windows 路径被实际使用）。
 
     std::vector<std::string> enumerateLocalIPv4() { return {"127.0.0.1"}; }
+
+    std::vector<uint16_t> findSafaiaUdpPortsForProcess(uint32_t) { return {}; }
 
     DiscoverySender::~DiscoverySender() {}
     void DiscoverySender::configure(std::string advertiseIp, int advertisePort, std::vector<std::string> targetIps, int intervalMs) {

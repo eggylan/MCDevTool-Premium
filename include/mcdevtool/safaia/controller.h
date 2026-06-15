@@ -68,6 +68,13 @@ namespace MCDevTool::Safaia {
         // 设置游戏日志(协议 4)回调。未设置时静默丢弃协议 4，不影响 UI RPC。
         void setMessageHandler(SafaiaMessageFn fn) { messageFn_ = std::move(fn); }
 
+        // 设置目标 Minecraft PID：用于 PID 定向 discovery 与握手 connect_port 归属校验。
+        // 应在 start() 之前调用(新启动顺序)；0 表示未知，退回旧行为(不校验、全端口广播)。
+        void setMinecraftPid(uint32_t pid) {
+            minecraftPid_.store(pid);
+            discovery_.setTargetPid(pid);
+        }
+
         // 启动 TCP server + UDP 发现；成功返回 true。
         bool start();
         void stop();
@@ -75,6 +82,9 @@ namespace MCDevTool::Safaia {
         bool isConnected() const { return state_.isConnected(); }
         bool isReady() const { return state_.isReady(); }
         int  boundPort() const { return boundPort_; }
+
+        // discovery 已发送轮次(供测试观察 PID 定向发送的暂停/恢复)。
+        uint64_t discoverySentCount() const { return discovery_.sentCount(); }
 
         UiDebugState&       state() { return state_; }
         const UiDebugState& state() const { return state_; }
@@ -153,6 +163,9 @@ namespace MCDevTool::Safaia {
         std::atomic<bool>          running_{false};
         std::atomic<bool>          enableSpawned_{false};
         std::atomic<bool>          clientConnected_{false}; // 供 RPC 等待谓词无锁判定
+        std::atomic<bool>          clientRejected_{false};  // 握手归属校验失败：要求尽快断开当前连接
+        std::atomic<uint32_t>      minecraftPid_{0};        // 目标 Minecraft PID(多实例隔离)
+        std::string                lastClientIp_;           // 最近一次连接的对端 IP(用于拒绝日志)
         std::optional<std::thread> acceptThread_;
         std::optional<std::thread> enableThread_;
 
