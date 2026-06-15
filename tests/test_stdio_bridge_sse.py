@@ -8,14 +8,52 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-SESSION_ID = "stdio-bridge-sse-test"
+SESSION_ID_PREFIX = "stdio-bridge-sse-test"
 
 
 class FakeMcpState(object):
     def __init__(self):
+        self.lock = threading.Lock()
         self.sse_connected = threading.Event()
+        self.sse_reconnected = threading.Event()
         self.send_notification = threading.Event()
+        self.drop_sse = threading.Event()
         self.stop = threading.Event()
+        self.session_id = None
+        self.initialize_count = 0
+        self.sse_connection_count = 0
+        self.rejected_get_count = 0
+
+    def create_session(self):
+        with self.lock:
+            self.initialize_count += 1
+            self.session_id = "%s-%d" % (SESSION_ID_PREFIX, self.initialize_count)
+            return self.session_id
+
+    def current_session(self):
+        with self.lock:
+            return self.session_id
+
+    def invalidate_session(self):
+        with self.lock:
+            self.session_id = None
+        self.drop_sse.set()
+
+    def record_sse_connection(self):
+        with self.lock:
+            self.sse_connection_count += 1
+            count = self.sse_connection_count
+        self.sse_connected.set()
+        if count >= 2:
+            self.sse_reconnected.set()
+
+    def record_rejected_get(self):
+        with self.lock:
+            self.rejected_get_count += 1
+
+    def rejected_gets(self):
+        with self.lock:
+            return self.rejected_get_count
 
 
 class FakeMcpHandler(BaseHTTPRequestHandler):
@@ -32,6 +70,7 @@ class FakeMcpHandler(BaseHTTPRequestHandler):
         method = request.get("method")
 
         if method == "initialize":
+            session_id = self.state.create_session()
             result = {
                 "jsonrpc": "2.0",
                 "id": request["id"],
@@ -41,17 +80,19 @@ class FakeMcpHandler(BaseHTTPRequestHandler):
                     "serverInfo": {"name": "fake-mcdk", "version": "1.0"},
                 },
             }
-            self._send_json(200, result, {"Mcp-Session-Id": SESSION_ID})
+            self._send_json(200, result, {"Mcp-Session-Id": session_id})
             return
 
-        if self.headers.get("Mcp-Session-Id") != SESSION_ID:
+        if method == "ping":
+            self._send_json(200, {"jsonrpc": "2.0", "id": request["id"], "result": {}})
+            return
+
+        if self.headers.get("Mcp-Session-Id") != self.state.current_session():
             self._send_json(404, {"error": "Session not found"})
             return
 
         if method == "notifications/initialized":
             self._send_empty(202)
-        elif method == "ping":
-            self._send_json(200, {"jsonrpc": "2.0", "id": request["id"], "result": {}})
         elif method == "tools/list":
             self._send_json(
                 200,
@@ -80,7 +121,8 @@ class FakeMcpHandler(BaseHTTPRequestHandler):
             )
 
     def do_GET(self):
-        if self.headers.get("Mcp-Session-Id") != SESSION_ID:
+        if self.headers.get("Mcp-Session-Id") != self.state.current_session():
+            self.state.record_rejected_get()
             self._send_json(404, {"error": "Session not found"})
             return
 
@@ -89,7 +131,7 @@ class FakeMcpHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        self.state.sse_connected.set()
+        self.state.record_sse_connection()
 
         try:
             self._write_chunk(b": connected\r\n\r\n")
@@ -101,6 +143,9 @@ class FakeMcpHandler(BaseHTTPRequestHandler):
                 self._write_chunk(payload)
 
             while not self.state.stop.wait(0.1):
+                if self.state.drop_sse.is_set():
+                    self.state.drop_sse.clear()
+                    return
                 self._write_chunk(b": keepalive\r\n\r\n")
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -147,6 +192,15 @@ def wait_for_message(output_queue, predicate, timeout, description):
         if predicate(message):
             return message
     raise AssertionError("Timed out waiting for %s; received: %r" % (description, seen))
+
+
+def wait_for_condition(predicate, timeout, description):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("Timed out waiting for %s" % description)
 
 
 def send_message(process, message):
@@ -226,13 +280,38 @@ def main():
         )
         assert "id" not in notification
 
+        state.invalidate_session()
+        wait_for_condition(lambda: state.rejected_gets() >= 1, 3, "one rejected stale-session GET")
+        time.sleep(1)
+        assert state.rejected_gets() == 1, (
+            "bridge kept retrying a stale SSE session after HTTP 404; rejected GET count: %d"
+            % state.rejected_gets()
+        )
+
+        send_message(
+            process,
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+        reconnected_tools = wait_for_message(
+            output_queue,
+            lambda message: message.get("id") == 3,
+            5,
+            "tools/list response after stale SSE session",
+        )
+        assert [tool["name"] for tool in reconnected_tools["result"]["tools"]] == ["fake_tool"]
+        assert state.sse_reconnected.wait(5), "bridge did not open a new SSE stream after reinitializing"
+        assert state.initialize_count == 2, "expected exactly one MCP reinitialization"
+
         started = time.monotonic()
         process.stdin.close()
         process.wait(timeout=3)
         elapsed = time.monotonic() - started
         assert process.returncode == 0, "bridge exited with code %s" % process.returncode
         assert elapsed < 3, "bridge shutdown took %.2fs" % elapsed
-        print("PASS: tools/list_changed forwarded over SSE and bridge stopped in %.2fs" % elapsed)
+        print(
+            "PASS: tools/list_changed forwarded, stale SSE session retired after one 404, "
+            "reinitialized successfully, and bridge stopped in %.2fs" % elapsed
+        )
     finally:
         state.stop.set()
         server.shutdown()

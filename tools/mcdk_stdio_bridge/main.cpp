@@ -471,10 +471,14 @@ namespace {
                 }
 
                 std::string buf;
+                int         responseStatus = 0;
                 client->Get(
                     StreamableEndpoint,
                     headers,
-                    [](const httplib::Response& response) { return response.status / 100 == 2; },
+                    [&](const httplib::Response& response) {
+                        responseStatus = response.status;
+                        return response.status / 100 == 2;
+                    },
                     [&](const char* data, size_t len) -> bool {
                         if (!sseRunning_.load()) {
                             return false;
@@ -496,6 +500,18 @@ namespace {
                     if (activeSseClient_ == client) {
                         activeSseClient_.reset();
                     }
+                }
+
+                // A 404 is permanent for this session (typically mcdk restarted and lost its
+                // in-memory sessions). Stop retrying the stale SSE target; the next tool request
+                // will use the existing request path to initialize a fresh MCP session.
+                if (responseStatus == 404) {
+                    std::lock_guard<std::mutex> lk(sseMtx_);
+                    if (gen == sseGen_ && sseSessionId_ == sid) {
+                        sseSessionId_.clear();
+                        ++sseGen_;
+                    }
+                    continue;
                 }
 
                 // 流结束(空闲超时/断开/会话切换)。若仍在运行且会话未变,稍后重开。
