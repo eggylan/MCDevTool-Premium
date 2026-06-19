@@ -6,6 +6,7 @@
 
 #include "../core_services.hpp"
 #include "../game_launcher.hpp"
+#include "log_bridge.hpp"
 #include "main_window.hpp"
 #include "theme_manager.hpp"
 
@@ -19,9 +20,13 @@ namespace mcdk::gui {
 
         ThemeManager::apply(app);
 
-        CoreServices core(config);
+        LogBridge logBridge;
+        CoreServices core(config, [&logBridge](const std::string& line, ConsoleColor color) {
+            CoreServices::printColoredAtomic(line, color);
+            logBridge.publish(line, color);
+        });
         GameLauncher launcher;
-        MainWindow   window(config, core, launcher);
+        MainWindow   window(config, core, launcher, logBridge);
         window.show();
 
         return QApplication::exec();

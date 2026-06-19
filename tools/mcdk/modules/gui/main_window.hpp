@@ -10,6 +10,8 @@ namespace mcdk {
 } // namespace mcdk
 
 namespace mcdk::gui {
+    class LogBridge;
+    class LogConsolePanel;
 
     class MainWindow : public QMainWindow {
     public:
@@ -17,12 +19,14 @@ namespace mcdk::gui {
             const nlohmann::json& config,
             CoreServices&         core,
             GameLauncher&         launcher,
+            LogBridge&            logBridge,
             QWidget*              parent = nullptr
         );
 
     private:
         CoreServices& core_;
         GameLauncher& launcher_;
+        LogConsolePanel* logConsole_ = nullptr;
     };
 
 } // namespace mcdk::gui

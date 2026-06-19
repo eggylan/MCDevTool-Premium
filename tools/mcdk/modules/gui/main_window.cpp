@@ -3,11 +3,14 @@
 #include <QLabel>
 #include <QStatusBar>
 #include <QString>
+#include <vector>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include "../core_services.hpp"
 #include "../game_launcher.hpp"
+#include "log_bridge.hpp"
+#include "log_console_panel.hpp"
 
 namespace mcdk::gui {
 
@@ -15,6 +18,7 @@ namespace mcdk::gui {
         const nlohmann::json& config,
         CoreServices&         core,
         GameLauncher&         launcher,
+        LogBridge&            logBridge,
         QWidget*              parent
     )
     : QMainWindow(parent),
@@ -33,21 +37,36 @@ namespace mcdk::gui {
 
         auto* layout = new QVBoxLayout(central);
         layout->setContentsMargins(24, 24, 24, 24);
+        layout->setSpacing(12);
 
-        auto* title = new QLabel(QStringLiteral("MCDK"), central);
+        auto* title = new QLabel(QStringLiteral("日志控制台"), central);
         title->setObjectName(QStringLiteral("MainWindowTitle"));
-        title->setAlignment(Qt::AlignCenter);
-        layout->addStretch(1);
+        title->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         layout->addWidget(title);
 
-        auto* state = new QLabel(QStringLiteral("GUI shell ready"), central);
+        auto* state = new QLabel(QStringLiteral("等待日志"), central);
         state->setObjectName(QStringLiteral("MainWindowState"));
-        state->setAlignment(Qt::AlignCenter);
+        state->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         layout->addWidget(state);
-        layout->addStretch(1);
+
+        logConsole_ = new LogConsolePanel(central);
+        layout->addWidget(logConsole_, 1);
+
+        std::vector<LogEntry> history;
+        if (core.logBuffer) {
+            for (const auto& line : core.logBuffer->getLatest(1000)) {
+                QString text = QString::fromStdString(line);
+                history.push_back(LogEntry{text, classifyLogLine(text)});
+            }
+        }
+        if (!history.empty()) {
+            logConsole_->appendEntries(history);
+        }
+        logConsole_->appendEntries(logBridge.snapshot());
+        connect(&logBridge, &LogBridge::lineArrived, logConsole_, &LogConsolePanel::appendLine, Qt::QueuedConnection);
 
         setCentralWidget(central);
-        statusBar()->showMessage(QStringLiteral("Ready"));
+        statusBar()->showMessage(QStringLiteral("日志控制台就绪"));
     }
 
 } // namespace mcdk::gui
