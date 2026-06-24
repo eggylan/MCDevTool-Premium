@@ -1,5 +1,7 @@
 #include "theme_manager.hpp"
 
+#include <iterator>
+
 #include <QApplication>
 #include <QFont>
 #include <QString>
@@ -60,25 +62,72 @@ namespace mcdk::gui {
             QLabel#LogMatchLabel {
                 color: #667085;
             }
+
+            QWidget#CodeExecPanel {
+                background: #ffffff;
+            }
+
+            QPlainTextEdit#CodeEditor {
+                color: #e4e7ec;
+                background: #101828;
+                border: 1px solid #202939;
+                border-radius: 6px;
+                selection-background-color: #2e90fa;
+                selection-color: #ffffff;
+            }
+
+            QLabel#CodeExecStatusLabel {
+                color: #667085;
+            }
         )"));
     }
 
     QColor ThemeManager::logColor(LogLevel level) {
-        switch (level) {
-        case LogLevel::Error:
-            return QColor(QStringLiteral("#ff6b6b"));
-        case LogLevel::Warning:
-            return QColor(QStringLiteral("#ffd166"));
-        case LogLevel::Debug:
-            return QColor(QStringLiteral("#5cc8ff"));
-        case LogLevel::Success:
-            return QColor(QStringLiteral("#55d187"));
-        case LogLevel::Developer:
-            return QColor(QStringLiteral("#a8b3cf"));
-        case LogLevel::Normal:
-        default:
-            return QColor(QStringLiteral("#e4e7ec"));
+        static const QColor kColors[] = {
+            QColor(QStringLiteral("#e4e7ec")), // Normal
+            QColor(QStringLiteral("#ff6b6b")), // Error
+            QColor(QStringLiteral("#ffd166")), // Warning
+            QColor(QStringLiteral("#5cc8ff")), // Debug
+            QColor(QStringLiteral("#55d187")), // Success
+            QColor(QStringLiteral("#a8b3cf")), // Developer
+        };
+        const auto idx = static_cast<int>(level);
+        if (idx < 0 || idx >= static_cast<int>(std::size(kColors))) {
+            return kColors[0];
         }
+        return kColors[idx];
+    }
+
+    QColor ThemeManager::syntaxColor(SyntaxRole role) {
+        static const QColor kColors[] = {
+            QColor(QStringLiteral("#c792ea")), // Keyword
+            QColor(QStringLiteral("#82aaff")), // Builtin
+            QColor(QStringLiteral("#c3e88d")), // String
+            QColor(QStringLiteral("#5c6788")), // Comment
+            QColor(QStringLiteral("#f78c6c")), // Number
+            QColor(QStringLiteral("#ffcb6b")), // Decorator
+            QColor(QStringLiteral("#82aaff")), // Definition
+        };
+        const auto idx = static_cast<int>(role);
+        if (idx < 0 || idx >= static_cast<int>(std::size(kColors))) {
+            return kColors[0];
+        }
+        return kColors[idx];
+    }
+
+    QColor ThemeManager::editorColor(EditorRole role) {
+        static const QColor kColors[] = {
+            QColor(QStringLiteral("#101828")), // Background (mirrors QPlainTextEdit#CodeEditor QSS)
+            QColor(QStringLiteral("#e4e7ec")), // Foreground
+            QColor(QStringLiteral("#0b1220")), // GutterBackground
+            QColor(QStringLiteral("#5b667d")), // GutterForeground
+            QColor(QStringLiteral("#18233b")), // CurrentLine
+        };
+        const auto idx = static_cast<int>(role);
+        if (idx < 0 || idx >= static_cast<int>(std::size(kColors))) {
+            return kColors[0];
+        }
+        return kColors[idx];
     }
 
 } // namespace mcdk::gui

@@ -31,9 +31,11 @@ if(MC_DEV_TOOL_ENABLE_GUI)
     target_compile_definitions(mcdk PRIVATE MCDK_ENABLE_GUI QT_NO_KEYWORDS)
     target_sources(mcdk PRIVATE
         modules/gui/app.cpp
+        modules/gui/code_exec_panel.cpp
         modules/gui/log_bridge.cpp
         modules/gui/log_console_panel.cpp
         modules/gui/main_window.cpp
+        modules/gui/python_highlighter.cpp
         modules/gui/theme_manager.cpp
     )
     target_link_libraries(mcdk PRIVATE Qt6::Widgets)
