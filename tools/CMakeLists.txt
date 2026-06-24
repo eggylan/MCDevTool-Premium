@@ -2,7 +2,7 @@ project(MC_DEV_TOOLS)
 
 option(MC_DEV_TOOL_BUILD_MCDK "BUILD MCDK EXECUTABLE" ON)
 option(MC_DEV_TOOL_BUILD_MCDK_STDIO_BRIDGE "BUILD MCDK STDIO MCP BRIDGE EXECUTABLE" ON)
-option(MC_DEV_TOOL_ENABLE_GUI "Build mcdk with Qt GUI" ON)
+option(MC_DEV_TOOL_ENABLE_GUI "Build mcdk-gui (Qt GUI) executable alongside mcdk" ON)
 
 # MCDK Executable
 if(MC_DEV_TOOL_BUILD_MCDK)

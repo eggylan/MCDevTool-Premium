@@ -34,7 +34,17 @@
             "displayName": "x64 MSVC Release",
             "inherits": "x64-msvc-debug",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release"
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_PREFIX_PATH": "H:/Qt/6.8.3/msvc2022_64"
+            }
+        },
+        {
+            "name": "x64-msvc-nogui-verify",
+            "displayName": "x64 MSVC no-GUI verify",
+            "inherits": "x64-msvc-release",
+            "cacheVariables": {
+                "MC_DEV_TOOL_ENABLE_GUI": "OFF",
+                "CMAKE_PREFIX_PATH": ""
             }
         },
         {
@@ -145,6 +155,10 @@
         {
             "name": "x64-msvc-release",
             "configurePreset": "x64-msvc-release"
+        },
+        {
+            "name": "x64-msvc-nogui-verify",
+            "configurePreset": "x64-msvc-nogui-verify"
         },
         {
             "name": "x64-clang-debug",
